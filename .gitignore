@@ -1,0 +1,91 @@
+# ===========================
+# Python
+# ===========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ===========================
+# Project generated outputs
+# ===========================
+output/
+project_dump.txt
+
+# ===========================
+# Environment & secrets
+# ===========================
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# ===========================
+# IDE / Editor
+# ===========================
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# ===========================
+# OS files
+# ===========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ===========================
+# Logs
+# ===========================
+*.log
+logs/
+
+# ===========================
+# Large data / model files (per requirements.txt: torch + sentence-transformers)
+# ===========================
+*.safetensors
+*.bin
+*.onnx
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.hdf5
+*.joblib
+*.pkl
+*.pickle
+*.parquet
+models/
+checkpoints/
+cache/
+*.tar.gz
+*.zip
+*.7z

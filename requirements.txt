@@ -1,0 +1,6 @@
+# 跑通 pipeline 只需标准库。真实 LLM 时按需取消注释。
+# requests   # 标准库 urllib 已够用；如需可装
+# openai>=1.0.0   # 真实 OpenAI agent
+# anthropic       # 真实 Anthropic agent
+torch>=2.0        # 后续错误聚类 / embedding 分析阶段用
+sentence-transformers  # 后续 trajectory 聚类

@@ -1,54 +1,154 @@
 # Finance Agent Evaluation Pipeline
 
-最小可运行骨架：**真实 benchmark 数据 + 真实工具调用 (fetch_url) + 完整 trajectory 记录 + 评分/错误归因**。
+A financial Agent evaluation pipeline: **real benchmark data + tool-calling agents + trajectory recording + 3-tier scoring + error attribution**.
 
-> 设计目标：把整条数据线跑通。无需训练、无需本地模型、无需 API key（默认用本地 rule-based agent，仍会真实抓取财报 URL）。
+> Design goal: run the full data line end-to-end. No training needed; default uses a local rule-based agent that still fetches real financial report URLs.
 
-## 目录结构
+## Directory structure
 
 ```
-finance_agent_eval/
-├── benchmark.py   # 真实 benchmark schema (对齐 Finance Agent Benchmark 537题格式)
-├── agent.py       # 真实 agent：工具循环 + trajectory 记录 (含 OpenAI/本地vLLM 骨架)
-├── runner.py      # 主循环：跑全量 -> trajectories.jsonl + run_summary.csv
-├── scorer.py      # 评分 + 错误 taxonomy 归因 -> results.csv + error_report.json
-├── config.py      # API key 等配置（真实 LLM 时用）
-├── output/        # 产物（自动生成）
+FinAgent/
+├── benchmark.py   # Task schema + live mini benchmark + FAB public dataset loader
+├── agent.py       # Agents: RuleBased + FinGPT + OpenAI + HuggingFace (ReAct + EDGAR tools)
+├── runner.py      # Main loop: run agent on tasks -> trajectories.jsonl + run_summary.csv
+├── evaluator.py   # Unified 3-tier scoring + analysis -> results.csv + error_report.json + plots
+├── config.py      # API keys, HF/FinGPT model, FAB data, scoring tolerance config
+├── requirements.txt
+├── data/          # Downloaded FAB public.csv (auto-created)
+├── output/        # Run artifacts (auto-created)
 └── README.md
 ```
 
-## 快速开始
+## Quick start
 
 ```bash
-cd finance_agent_eval
-pip install -r requirements.txt   # 仅需 requests 等标准库基本就够
-python runner.py                  # 跑 benchmark
-python scorer.py                  # 评分 + 错误归因
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the mini benchmark (3 tasks, rule-based agent)
+python runner.py
+
+# Score and analyze results
+python evaluator.py
 ```
 
-产物：
-- `output/trajectories.jsonl` — 每条完整轨迹（step / thought / tool / observation / latency）
-- `output/run_summary.csv` — 每题聚合指标
-- `output/results.csv` — 评分明细
-- `output/error_report.json` — 错误分布 / accuracy / latency / cost
+Outputs:
+- `output/trajectories.jsonl` — full trajectory per task (step / thought / tool / observation / latency)
+- `output/run_summary.csv` — per-task aggregate metrics
+- `output/results.csv` — scored results (3-tier breakdown + error_type)
+- `output/error_report.json` — error distribution / accuracy / latency / cost
+- `output/accuracy_by_category.png` — bar chart of accuracy by FAB category
+- `output/accuracy_by_difficulty.png` — bar chart of accuracy by difficulty
 
-## 切到真实 LLM（可选）
+## Agents
 
-`agent.py` 已内置 `OpenAIAgent` 骨架：
+### 1. Rule-based agent (default, no API key needed)
 
-```python
-from agent import OpenAIAgent
-from runner import run_evaluation
-run_evaluation(OpenAIAgent(model="gpt-4o-mini"))
+Local rule-based agent with hardcoded answers for the 3 mini benchmark questions. Useful for pipeline validation.
+
+```bash
+python runner.py
 ```
 
-填 `config.py` 的 API key 即可。本地 vLLM（OpenAI 兼容接口）同理：改 `base_url`。
+### 2. HuggingFace Inference agent (baseline, free with HF account)
 
-## 对接正式 Finance Agent Benchmark (537 题)
+Uses HuggingFace Inference API with ReAct loop and EDGAR search tools. Default model: `deepseek-ai/DeepSeek-V4-Flash`.
 
-数据结构已对齐 FAB schema（question / gold_answer / reasoning_steps / rubric / evidence）。
-把 `benchmark.py` 的 `TASKS` 换成从官方 CSV/JSONL 加载即可，下游 runner/scorer **零改动**：
+```bash
+# Set HF token (get free at huggingface.co/settings/tokens)
+export HF_TOKEN="hf_xxxxx"
 
-```python
-tasks = load_tasks("path/to/fab_questions.jsonl")
+# Run FAB 50-question public set
+FINAGENT_AGENT=hf FINAGENT_BENCH=fab python runner.py
+
+# Quick test with 5 questions
+FINAGENT_AGENT=hf FINAGENT_BENCH=fab FINAGENT_NUM_TASKS=5 python runner.py
+
+# Score with 3-tier evaluation
+python evaluator.py
+```
+
+Configuration (env vars, see `config.py`):
+- `HF_TOKEN` — HuggingFace access token
+- `HF_MODEL` — model for agent inference (default: `deepseek-ai/DeepSeek-V4-Flash`)
+- `HF_JUDGE_MODEL` — model for LLM-as-Judge T3 scoring (default: same as agent)
+
+### 3. FinGPT baseline agent (requires local GPU + model download)
+
+FinGPT is an open-source financial LLM (LoRA adapter on falcon-7b). It is a **deliberately weak baseline**.
+
+```bash
+FINAGENT_AGENT=fingpt FINAGENT_BENCH=fab python runner.py
+```
+
+Configuration:
+- `FINGPT_BASE_MODEL` — base model (default: `tiiuae/falcon-7b`)
+- `FINGPT_PEFT_MODEL` — LoRA adapter (default: `FinGPT/fingpt-mt_falcon-7b_lora`)
+- `FINGPT_DEVICE` — device (default: `cuda`)
+
+### 4. OpenAI agent (upper bound, requires API key)
+
+```bash
+export OPENAI_API_KEY="sk-xxxxx"
+FINAGENT_AGENT=openai FINAGENT_BENCH=fab python runner.py
+```
+
+## Tools (ReAct agent)
+
+The HuggingFace and OpenAI agents use a ReAct loop with the following tools:
+
+| Tool | Description |
+|------|-------------|
+| `edgar_search` | Search SEC EDGAR full-text search for filings |
+| `fetch_url` | Fetch a URL and return clean text (strips HTML tags) |
+| `parse_html` | Fetch + parse HTML page, return structured text |
+| `retrieve_information` | Retrieve specific information from collected text |
+
+Max tool calls per task: 10 (configurable via `MAX_TOOL_CALLS_PER_TASK` in `config.py`).
+
+## Finance Agent Benchmark (FAB)
+
+The full 537-question FAB dataset is split into:
+- **Public validation (50 questions)** — auto-downloaded, CC BY 4.0
+- **Private validation (150 questions)** — requires license from Vals AI (contact antoine@vals.ai)
+- **Test set (337 questions)** — permanently private (leaderboard only)
+
+```bash
+# Run FAB public subset
+FINAGENT_BENCH=fab python runner.py
+```
+
+FAB question types: Quantitative Retrieval, Qualitative Retrieval, Numerical Reasoning, Market Analysis, Trends, Beat or Miss, Complex Retrieval, Financial Modeling Projections, Adjustments.
+
+## 3-Tier Evaluation
+
+`evaluator.py` uses a 3-tier scoring system:
+
+| Tier | Method | Description |
+|------|--------|-------------|
+| T1 | Exact match | Normalized string comparison (after answer normalization) |
+| T2 | Numeric/Rubric | Numeric tolerance comparison + rubric keyword coverage |
+| T3 | LLM-as-Judge | LLM evaluates each rubric criterion (YES/NO), coverage >= 60% = correct |
+
+Final `is_correct = T1 OR T2 OR T3`.
+
+Error taxonomy (6 labels):
+- `retrieval_failure` — did not retrieve / retrieved wrong source
+- `numeric_error` — wrong number, unit, or rounding
+- `citation_missing` — missing source citation
+- `tool_error` — tool call itself errored
+- `qualitative_incomplete` — qualitative answer missing key points
+- `correct` — passed
+
+Scoring config (env vars in `config.py`):
+- `SCORING_NUMERIC_TOL` — relative tolerance for numeric scoring (default: `0.05`)
+- `SCORING_QUANTITATIVE_TOL` — looser tolerance (default: `0.5`)
+- `SCORING_RUBRIC_COVERAGE` — coverage threshold for rubric/T3 scoring (default: `0.6`)
+
+## Git rollback
+
+The `v0.1-skeleton` tag marks the pre-FinGPT baseline:
+```bash
+git checkout main              # back to skeleton
+git reset --hard v0.1-skeleton # discard everything after skeleton
 ```

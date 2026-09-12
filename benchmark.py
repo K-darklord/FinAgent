@@ -15,6 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 import json
+import csv
+import urllib.request
+import re
 
 
 @dataclass
@@ -125,6 +128,126 @@ def load_tasks(path: str | Path | None = None) -> list[Task]:
     return tasks
 
 
+# ======================================================================
+# Finance Agent Benchmark (FAB) public dataset loader
+# Source: https://github.com/vals-ai/finance-agent (arXiv:2508.00828)
+# The full 537-question set is proprietary (gated behind platform.vals.ai).
+# The public subset (~50 questions) is in data/public.csv.
+# ======================================================================
+
+# Map FAB "Question Type" to Task.category (normalize whitespace quirks).
+_FAB_CATEGORY_MAP = {
+    "Simple retrieval - Quantitative": "Quantitative Retrieval",
+    "Simple retrieval - Qualitative": "Qualitative Retrieval",
+    "Complex Retrieval": "Complex Retrieval",
+    "Numerical Reasoning": "Numerical Reasoning",
+    "Market Analysis": "Market Analysis",
+    "Trends": "Trends",
+    "Beat or Miss": "Beat or Miss",
+    "Financial Modeling  Projections": "Financial Modeling Projections",  # normalize double space
+}
+
+
+def _map_question_type(qtype: str) -> str:
+    """I normalize FAB Question Type whitespace and map to a Task category."""
+    key = re.sub(r"\s+", " ", qtype.strip())
+    return _FAB_CATEGORY_MAP.get(key, key or "Unknown")
+
+
+def _expert_time_to_difficulty(mins) -> str:
+    """I convert FAB expert-time (minutes) to Easy/Medium/Hard."""
+    try:
+        m = float(mins)
+    except (TypeError, ValueError):
+        return "Medium"
+    if m <= 5:
+        return "Easy"
+    if m <= 15:
+        return "Medium"
+    return "Hard"
+
+
+def _parse_rubric(rubric_str: str) -> tuple[list[str], list[dict]]:
+    """I parse FAB Rubric JSON into (plain_criteria_list, structured_for_metadata).
+    On parse failure I return ([], []) so the pipeline never crashes on bad data."""
+    try:
+        items = json.loads(rubric_str)
+        if not isinstance(items, list):
+            return ([], [])
+        plain = [c.get("criteria", "") for c in items if isinstance(c, dict)]
+        structured = [c for c in items if isinstance(c, dict)]
+        return (plain, structured)
+    except (json.JSONDecodeError, TypeError):
+        return ([], [])
+
+
+def _download_fab_csv(dest: Path) -> Path:
+    """I download public.csv to dest, creating parent dir if needed."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    urllib.request.urlretrieve(
+        "https://raw.githubusercontent.com/vals-ai/finance-agent/main/data/public.csv",
+        str(dest),
+    )
+    return dest
+
+
+def load_fab_questions(
+    csv_path: str | Path | None = None,
+    download: bool = True,
+) -> list[Task]:
+    """I load FAB public questions from CSV. If csv_path is None I use config.FAB_DATA_PATH.
+    If the file does not exist and download=True, I auto-fetch public.csv.
+    I map FAB columns to the Task dataclass and synthesize task_id = fab_{idx:03d}.
+    FAB ships no evidence URLs, so evidence=[] (agent answers from parametric knowledge).
+    """
+    from config import FAB_DATA_PATH
+
+    if csv_path is None:
+        csv_path = FAB_DATA_PATH
+    p = Path(csv_path)
+
+    if not p.exists() and download:
+        print(f"[FAB] Downloading public.csv to {p} ...")
+        _download_fab_csv(p)
+
+    if not p.exists():
+        print(f"[FAB] No CSV at {p}; returning empty list.")
+        return []
+
+    tasks: list[Task] = []
+    with p.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for idx, row in enumerate(reader, start=1):
+            rubric_plain, rubric_structured = _parse_rubric(row.get("Rubric", "[]"))
+            tasks.append(Task(
+                task_id=f"fab_{idx:03d}",
+                category=_map_question_type(row.get("Question Type", "Unknown")),
+                difficulty=_expert_time_to_difficulty(row.get("Expert time (mins)", "")),
+                prompt=row.get("Question", "").strip(),
+                gold_answer=row.get("Answer", "").strip(),
+                reasoning_steps=[],
+                rubric=rubric_plain,
+                evidence=[],
+                metadata={
+                    "question_type_raw": row.get("Question Type", ""),
+                    "expert_time_mins": row.get("Expert time (mins)", ""),
+                    "rubric_structured": rubric_structured,
+                },
+            ))
+    return tasks
+
+
 if __name__ == "__main__":
-    for t in load_tasks():
-        print(f"[{t.task_id}] {t.category:<26} {t.difficulty:<6} {t.prompt[:60]}...")
+    # Show mini benchmark
+    mini = load_tasks()
+    print(f"Mini benchmark: {len(mini)} tasks")
+    for t in mini:
+        print(f"  [{t.task_id}] {t.category:<26} {t.difficulty:<6} {t.prompt[:60]}...")
+
+    # Show FAB public subset
+    fab = load_fab_questions()
+    print(f"\nFAB public subset: {len(fab)} tasks")
+    for t in fab[:5]:
+        print(f"  [{t.task_id}] {t.category:<30} {t.difficulty:<6} {t.prompt[:60]}...")
+    if len(fab) > 5:
+        print(f"  ... and {len(fab) - 5} more")

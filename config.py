@@ -48,3 +48,21 @@ SCORING_QUANTITATIVE_TOL = float(os.getenv("SCORING_QUANTITATIVE_TOL", "0.5"))  
 SCORING_RUBRIC_COVERAGE = float(os.getenv("SCORING_RUBRIC_COVERAGE", "0.6"))  # threshold for rubric-based scoring
 # Numeric comparison tolerance (e.g. 0.05 = 5% difference allowed)
 SCORING_NUMERIC_TOLERANCE = float(os.getenv("SCORING_NUMERIC_TOLERANCE", "0.05"))
+
+
+# ======================================================================
+# Evaluation Standard v2.0 (2026-09-13) — 2-tier continuous scoring
+# See EVALUATION_STANDARD.md for full spec
+# ======================================================================
+# Tier 1: Numeric Accuracy (rule-based, deterministic, continuous 0-1)
+T1_NUMERIC_TOLERANCE = float(os.getenv("T1_NUMERIC_TOLERANCE", "0.01"))  # 1% relative tolerance
+T1_PASS_THRESHOLD = float(os.getenv("T1_PASS_THRESHOLD", "0.5"))         # min score to pass T1
+
+# Tier 2: LLM Semantic Judgment (continuous 0-1, with dealbreaker)
+T2_JUDGE_MODEL = os.getenv("T2_JUDGE_MODEL", "deepseek-ai/DeepSeek-V4-Flash")
+T2_PASS_THRESHOLD = float(os.getenv("T2_PASS_THRESHOLD", "0.5"))          # min score to pass T2
+T2_TEMPERATURE = 0                                                          # reproducibility
+T2_MAX_TRAJECTORY_CHARS = int(os.getenv("T2_MAX_TRAJECTORY_CHARS", "4000"))  # truncation for context
+
+# Final aggregation
+FINAL_PASS_THRESHOLD = float(os.getenv("FINAL_PASS_THRESHOLD", "0.5"))    # final_score >= this -> pass

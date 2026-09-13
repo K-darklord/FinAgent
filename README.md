@@ -1,6 +1,6 @@
 # Finance Agent Evaluation Pipeline
 
-A financial Agent evaluation pipeline: **real benchmark data + tool-calling agents + trajectory recording + 3-tier scoring + error attribution**.
+A financial Agent evaluation pipeline: **real benchmark data + tool-calling agents + trajectory recording + 2-tier continuous scoring + dealbreaker**.
 
 > Design goal: run the full data line end-to-end. No training needed; default uses a local rule-based agent that still fetches real financial report URLs.
 
@@ -11,7 +11,7 @@ FinAgent/
 ├── benchmark.py   # Task schema + live mini benchmark + FAB public dataset loader
 ├── agent.py       # Agents: RuleBased + FinGPT + OpenAI + HuggingFace (ReAct + EDGAR tools)
 ├── runner.py      # Main loop: run agent on tasks -> trajectories.jsonl + run_summary.csv
-├── evaluator.py   # Unified 3-tier scoring + analysis -> results.csv + error_report.json + plots
+├── evaluator.py   # 2-tier continuous scoring (T1 numeric + T2 LLM semantic) + error attribution
 ├── config.py      # API keys, HF/FinGPT model, FAB data, scoring tolerance config
 ├── requirements.txt
 ├── data/          # Downloaded FAB public.csv (auto-created)
@@ -120,30 +120,44 @@ FINAGENT_BENCH=fab python runner.py
 
 FAB question types: Quantitative Retrieval, Qualitative Retrieval, Numerical Reasoning, Market Analysis, Trends, Beat or Miss, Complex Retrieval, Financial Modeling Projections, Adjustments.
 
-## 3-Tier Evaluation
+## Evaluation (v2.1 — 2-Tier Continuous Scoring)
 
-`evaluator.py` uses a 3-tier scoring system:
+FinAgent uses a **2-tier continuous scoring system**, aligned with the FAB "Partial Credit" metric. All scores are continuous in [0, 1], not binary pass/fail.
 
-| Tier | Method | Description |
-|------|--------|-------------|
-| T1 | Exact match | Normalized string comparison (after answer normalization) |
-| T2 | Numeric/Rubric | Numeric tolerance comparison + rubric keyword coverage |
-| T3 | LLM-as-Judge | LLM evaluates each rubric criterion (YES/NO), coverage >= 60% = correct |
+| Tier | Method | LLM | Output | Purpose |
+|------|--------|-----|--------|---------|
+| T1 | Numeric + keyword accuracy (rule-based) | No | Continuous 0-1 | Check if pred contains core gold numbers OR keywords (for qualitative answers) |
+| T2 | LLM semantic judgment (3-vote) | Yes | Continuous 0-1 | Semantic rubric scoring (median of 3 votes), trace-aware, with dealbreaker (majority 2/3) |
 
-Final `is_correct = T1 OR T2 OR T3`.
+**Final score** = `max(T1_score, T2_score)`, unless a dealbreaker triggers (then 0).
 
-Error taxonomy (6 labels):
-- `retrieval_failure` — did not retrieve / retrieved wrong source
-- `numeric_error` — wrong number, unit, or rounding
-- `citation_missing` — missing source citation
-- `tool_error` — tool call itself errored
-- `qualitative_incomplete` — qualitative answer missing key points
-- `correct` — passed
+**Dealbreaker**: If the answer contradicts a gold fact (any `contradiction` rubric criterion), `final_score = 0` regardless of numeric matches. This prevents hallucinated answers from scoring.
 
-Scoring config (env vars in `config.py`):
-- `SCORING_NUMERIC_TOL` — relative tolerance for numeric scoring (default: `0.05`)
-- `SCORING_QUANTITATIVE_TOL` — looser tolerance (default: `0.5`)
-- `SCORING_RUBRIC_COVERAGE` — coverage threshold for rubric/T3 scoring (default: `0.6`)
+**Pass threshold**: `final_score >= 0.5` (configurable via `FINAL_PASS_THRESHOLD`).
+
+### Error taxonomy
+
+| Error type | Condition |
+|------------|-----------|
+| `correct` | `final_score >= threshold` |
+| `factual_contradiction` | Dealbreaker triggered (contradiction found) |
+| `complete_failure` | T1=0 and T2=0 |
+| `numeric_error` | T1 > 0 but below threshold |
+| `qualitative_incomplete` | T2 > 0 but below threshold |
+
+### Configuration (in `config.py`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `T1_NUMERIC_TOLERANCE` | 0.01 | T1 relative tolerance for numeric matching |
+| `T1_PASS_THRESHOLD` | 0.5 | T1 minimum score to pass |
+| `T2_JUDGE_MODEL` | `deepseek-ai/DeepSeek-V4-Flash` | LLM model for T2 |
+| `T2_PASS_THRESHOLD` | 0.5 | T2 minimum score to pass |
+| `T2_TEMPERATURE` | 0 | For reproducibility |
+| `T2_MAX_TRAJECTORY_CHARS` | 4000 | Truncate trajectory for judge context |
+| `FINAL_PASS_THRESHOLD` | 0.5 | Final score threshold |
+
+**Full spec**: see [EVALUATION_STANDARD.md](EVALUATION_STANDARD.md).
 
 ## Git rollback
 

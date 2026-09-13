@@ -43,7 +43,9 @@ def fetch_url(url: str, timeout: int = 20) -> str:
     """
     Fetch a URL and return clean text content.
     I use a SEC-compliant User-Agent with contact email.
-    I strip HTML tags and return readable text, falling back to local stub on failure.
+    I strip HTML tags, skip XBRL metadata (common in SEC iXBRL filings),
+    and return readable text, falling back to local stub on failure.
+    I return up to 8000 chars to capture actual content past XBRL headers.
     """
     import re as _re
     try:
@@ -58,14 +60,47 @@ def fetch_url(url: str, timeout: int = 20) -> str:
         if "<html" in raw.lower() or "<body" in raw.lower():
             raw = _re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=_re.DOTALL | _re.IGNORECASE)
             raw = _re.sub(r"<style[^>]*>.*?</style>", "", raw, flags=_re.DOTALL | _re.IGNORECASE)
+            # Strip HTML tags
             text = _re.sub(r"<[^>]+>", " ", raw)
+            # Decode common entities
             text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&#39;", "'")
             text = text.replace("&quot;", '"').replace("&lt;", "<").replace("&gt;", ">")
+            text = text.replace("&#8211;", "-").replace("&#8212;", "\u2014").replace("&#8217;", "'")
+            text = text.replace("&#160;", " ").replace("&#8220;", '"').replace("&#8221;", '"')
+            # Collapse whitespace
+            text = " ".join(text.split())
+
+            # Skip XBRL metadata: SEC iXBRL filings have XBRL tags BEFORE the actual content.
+            # The real filing text (UNITED STATES, SECURITIES AND EXCHANGE...) often starts
+            # at 100K+ chars into the document. I aggressively strip XBRL-like content.
+            text = _re.sub(r"(iso4217|xbrli|xbrldi|fasb\.org|xbrl\.sec\.gov|xbrl\.org)\S*", " ", text)
+            text = _re.sub(r"\b[A-Z0-9]{8,}-[A-Z0-9-]+\b", " ", text)  # UUID-like tags
+            # Remove long numeric/metadata runs (50+ chars of digits/dots/dashes)
+            text = _re.sub(r"[\d\s\-\\.]{50,}", " ", text)
+            text = " ".join(text.split())  # re-collapse whitespace
+
+            # Find the first substantial text content
+            # SEC filings: the actual content starts at "UNITED STATES" or "SECURITIES AND EXCHANGE"
+            # For iXBRL filings this can be 100K+ chars into the text. I search up to 500K.
+            start_markers = ["UNITED STATES", "SECURITIES AND EXCHANGE", "FORM 10-K", "FORM 10-Q",
+                             "ANNUAL REPORT", "QUARTERLY REPORT", "SCHEDULE 14A", "NEWS RELEASE",
+                             "EXHIBIT", "FOR IMMEDIATE", "PART I"]
+            earliest = len(text)
+            for marker in start_markers:
+                idx = text.find(marker)
+                if 0 < idx < earliest and idx < 500000:
+                    earliest = idx
+            if earliest < len(text):
+                text = text[earliest:]
+
+            # Final cleanup: remove any remaining XBRL inline tags
+            text = _re.sub(r"<ix:[^>]*>", " ", text)
+            text = _re.sub(r"</ix:[^>]*>", " ", text)
             text = " ".join(text.split())
         else:
             text = raw
 
-        snippet = text[:3000]
+        snippet = text[:8000]
         if len(snippet.strip()) < 50:
             return _local_fallback(url)
         return snippet
@@ -135,10 +170,11 @@ def edgar_search(query: str, form_type: str = "", max_results: int = 5) -> str:
         return f"EDGAR search failed: {e}"
 
 
-def parse_html(url: str, timeout: int = 15) -> str:
+def parse_html(url: str, timeout: int = 20) -> str:
     """
     Fetch a URL and extract clean text from HTML.
-    I strip tags, scripts, styles and return readable text.
+    I strip tags, scripts, styles, skip XBRL metadata blocks, and return readable text.
+    I return up to 15000 chars to capture actual content in long SEC filings.
     """
     import re as _re
 
@@ -157,22 +193,57 @@ def parse_html(url: str, timeout: int = 15) -> str:
         # Decode common entities
         text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&#39;", "'")
         text = text.replace("&quot;", '"').replace("&lt;", "<").replace("&gt;", ">")
+        text = text.replace("&#8211;", "-").replace("&#8212;", "\u2014").replace("&#8217;", "'")
+        text = text.replace("&#160;", " ").replace("&#8220;", '"').replace("&#8221;", '"')
         # Collapse whitespace
         text = " ".join(text.split())
-        return text[:3000] if text else "[empty page]"
+
+        # Skip XBRL metadata: SEC iXBRL filings have XBRL tags BEFORE the actual content.
+        # The real filing text (UNITED STATES, SECURITIES AND EXCHANGE...) often starts
+        # at 100K+ chars into the document. I aggressively strip XBRL-like content.
+        # Remove long runs of XBRL metadata (numeric tags, URLs, iso4217, xbrl identifiers)
+        text = _re.sub(r"(iso4217|xbrli|xbrldi|fasb\.org|xbrl\.sec\.gov|xbrl\.org)\S*", " ", text)
+        text = _re.sub(r"\b[A-Z0-9]{8,}-[A-Z0-9-]+\b", " ", text)  # UUID-like tags
+        # Remove long numeric/metadata runs (50+ chars of digits/dots/dashes)
+        text = _re.sub(r"[\d\s\-\\.]{50,}", " ", text)
+        text = " ".join(text.split())  # re-collapse whitespace
+
+        # Find the first substantial text content
+        # SEC filings: the actual content starts at "UNITED STATES" or "SECURITIES AND EXCHANGE"
+        # For iXBRL filings this can be 100K+ chars into the text. I search up to 500K.
+        start_markers = ["UNITED STATES", "SECURITIES AND EXCHANGE", "FORM 10-K", "FORM 10-Q",
+                         "ANNUAL REPORT", "QUARTERLY REPORT", "SCHEDULE 14A", "NEWS RELEASE",
+                         "EXHIBIT", "FOR IMMEDIATE", "PART I"]
+        earliest = len(text)
+        for marker in start_markers:
+            idx = text.find(marker)
+            if 0 < idx < earliest and idx < 500000:
+                earliest = idx
+        if earliest < len(text):
+            text = text[earliest:]
+
+        # Final cleanup: remove any remaining XBRL inline tags
+        text = _re.sub(r"<ix:[^>]*>", " ", text)
+        text = _re.sub(r"</ix:[^>]*>", " ", text)
+        text = " ".join(text.split())
+
+        return text[:15000] if text else "[empty page]"
     except Exception as e:
         return f"parse_html failed: {e}"
 
 
-def retrieve_information(text: str, query: str, max_chars: int = 1500) -> str:
+def retrieve_information(text: str = "", query: str = "", max_chars: int = 1500) -> str:
     """
     Retrieve relevant sentences from a block of text based on a query.
     I do simple keyword matching: find sentences containing query keywords.
+    I accept missing text gracefully and return a helpful message.
     """
     import re as _re
 
-    if not text or not query:
-        return ""
+    if not query:
+        return "Error: query parameter is required"
+    if not text:
+        return "Error: text parameter is required. Use fetch_url or parse_html first to get document text, then pass it as the text parameter."
 
     # Split into sentences
     sentences = _re.split(r'(?<=[.!?])\s+', text)
@@ -216,8 +287,8 @@ TOOL_SCHEMA = [
     },
     {
         "name": "retrieve_information",
-        "description": "Find relevant sentences from a text block based on keywords in the query. Use this to extract specific data from retrieved documents.",
-        "parameters": {"text": "string (the text to search)", "query": "string (what to look for)"},
+        "description": "Find relevant sentences from a text block based on keywords in the query. Use this to extract specific data from retrieved documents. IMPORTANT: the text parameter must be the output from a previous fetch_url or parse_html call. Do NOT call this tool without first fetching a document.",
+        "parameters": {"text": "string (the text to search, from previous fetch_url/parse_html output)", "query": "string (what to look for)"},
     },
 ]
 
@@ -497,12 +568,14 @@ class HuggingFaceAgent(BaseAgent):
         return self._client
 
     def _generate(self, messages: list) -> str:
-        """I call the HF router chat completions endpoint (OpenAI-compatible)."""
+        """I call the HF router chat completions endpoint (OpenAI-compatible).
+        I set temperature=0 for reproducible outputs."""
         client = self._get_client()
         resp = client.chat.completions.create(
             model=self.model,
             messages=messages,
             max_tokens=self.max_tokens,
+            temperature=0,
         )
         return resp.choices[0].message.content or ""
 
@@ -526,8 +599,14 @@ class HuggingFaceAgent(BaseAgent):
             + "\n\nTo use a tool, respond with EXACTLY this format:\n"
             "TOOL: <tool_name>\nARGS: {key: value}\n\n"
             "If you have enough information to answer, respond with:\n"
-            "ANSWER: <your final answer>\n"
-            "Give only the final answer, no reasoning steps."
+            "ANSWER: <your final answer>\n\n"
+            "IMPORTANT formatting rules:\n"
+            "- ANSWER must contain ONLY the factual answer (numbers, names, or direct statements).\n"
+            "- Do NOT prefix the answer with reasoning like 'The question asks' or 'Let me'.\n"
+            "- Do NOT include intermediate reasoning in the ANSWER line.\n"
+            "- If the answer is a number, give the number (with unit if applicable).\n"
+            "- If the answer is qualitative, state it directly (e.g., 'Workday reports Gross Revenue Retention Rate').\n"
+            "- Reasoning steps belong in TOOL calls (before the ANSWER), NOT in the ANSWER itself."
         )
         all_messages = [{"role": "system", "content": system_msg}] + messages
         try:
@@ -536,6 +615,144 @@ class HuggingFaceAgent(BaseAgent):
             return ("error", "", {}, f"LLM error: {e}")
 
         resp = resp.strip()
+
+
+        # Try XML-style tool call format first:
+        # Some models use <tool_call>name<arg_key>key</arg_key><arg_value>val</arg_value></tool_call>
+        import re as _re_xml
+        valid_tools = {t["name"] for t in available_tools}
+        _xml_block_pat = r'<tool_call>(\w+)\s*\n(.*?)</tool_call>'
+        xml_blocks = _re_xml.findall(_xml_block_pat, resp, flags=_re_xml.DOTALL)
+        if xml_blocks:
+            for tool_name_raw, block_text in xml_blocks:
+                tool_name = tool_name_raw.strip().lower()
+                matched = tool_name if tool_name in valid_tools else None
+                if not matched:
+                    for vt in valid_tools:
+                        if vt in tool_name or tool_name in vt:
+                            matched = vt
+                            break
+                if not matched:
+                    continue
+                _xml_arg_pat = r'<arg_key>(\w+)</arg_key>\s*<arg_value>(.*?)</arg_value>'
+                arg_pairs = _re_xml.findall(_xml_arg_pat, block_text, flags=_re_xml.DOTALL)
+                tool_args = {k.strip(): v.strip() for k, v in arg_pairs} if arg_pairs else {}
+                if "type" in tool_args and "form_type" not in tool_args:
+                    tool_args["form_type"] = tool_args.pop("type")
+                return ("tool", matched, tool_args, "")
+
+        # Fallback: incomplete XML tags (no closing tag)
+        # Some models output  only open tag with no close.
+        _xml_open_pat = r'<tool_call>(\w+)\s*\n(.*?)(?=<tool_call>|$)'
+        xml_open_blocks = _re_xml.findall(_xml_open_pat, resp, flags=_re_xml.DOTALL)
+        if xml_open_blocks:
+            for tool_name_raw, block_text in xml_open_blocks:
+                tool_name = tool_name_raw.strip().lower()
+                matched = tool_name if tool_name in valid_tools else None
+                if not matched:
+                    for vt in valid_tools:
+                        if vt in tool_name or tool_name in vt:
+                            matched = vt
+                            break
+                if not matched:
+                    continue
+                # Try arg_key/arg_value pairs first
+                _xml_arg_pat = r'<arg_key>(\w+)</arg_key>\s*<arg_value>(.*?)</arg_value>'
+                arg_pairs = _re_xml.findall(_xml_arg_pat, block_text, flags=_re_xml.DOTALL)
+                tool_args = {k.strip(): v.strip() for k, v in arg_pairs} if arg_pairs else {}
+                # If no arg_key pairs, try ARGS: {json} format
+                if not tool_args:
+                    import re as _re_fb
+                    m = _re_fb.search(r'ARGS:\s*(.*)', block_text, flags=_re_fb.DOTALL)
+                    if m:
+                        arg_text = m.group(1).strip()
+                        try:
+                            import json as _json_fb
+                            tool_args = _json_fb.loads(arg_text)
+                        except Exception:
+                            pass
+                        if not tool_args:
+                            try:
+                                import ast as _ast_fb
+                                parsed = _ast_fb.literal_eval(arg_text)
+                                if isinstance(parsed, dict):
+                                    tool_args = parsed
+                            except Exception:
+                                pass
+                        if not tool_args:
+                            pairs = _re_fb.findall(r'[\'\"]?(\w+)[\'\"]?\s*:\s*[\'\"]([^\'\"]*)[\'\"]', arg_text)
+                            if pairs:
+                                tool_args = {k.strip(): v.strip() for k, v in pairs}
+                if 'type' in tool_args and 'form_type' not in tool_args:
+                    tool_args['form_type'] = tool_args.pop('type')
+                if tool_args or matched:
+                    return ('tool', matched, tool_args, '')
+
+        # Try markdown code block format. Models use several variants:
+        #   A) ```tool_name\nARGS: {json}```  (tool name on fence line)
+        #   B) ```\ntool_name\nARGS: {json}```  (tool name on next line)
+        #   C) ```\ntool_name\n`key`\n`value`  (backtick-quoted key-value pairs)
+        import re as _re_md
+        # Match opening fence, optional tool name, block content, closing fence
+        md_blocks = _re_md.findall(r'```(\w+)?\s*\n(.*?)```', resp, flags=_re_md.DOTALL)
+        if md_blocks:
+            for tool_name_raw, block_text in md_blocks:
+                # If tool name not on fence line, extract from first line of block
+                tool_name = (tool_name_raw or "").strip().lower()
+                if not tool_name:
+                    lines_bk = block_text.strip().split("\n")
+                    if lines_bk:
+                        tool_name = lines_bk[0].strip().lower()
+                        block_text = "\n".join(lines_bk[1:])
+                # Skip non-tool code blocks
+                if tool_name in ("python", "json", "javascript", "bash", "sh", "text", "yaml"):
+                    continue
+                # Accept exact or fuzzy match
+                matched = tool_name if tool_name in valid_tools else None
+                if not matched:
+                    for vt in valid_tools:
+                        if vt in tool_name or tool_name in vt:
+                            matched = vt
+                            break
+                if not matched:
+                    continue
+                # Strategy 1: parse ARGS: {json} from block
+                tool_args = {}
+                for line in block_text.split("\n"):
+                    for arg_marker in ["ARGS:", "args:", "Args:"]:
+                        if arg_marker in line:
+                            arg_text = line[line.index(arg_marker) + len(arg_marker):].strip()
+                            tool_args = {}
+                            try:
+                                import json as _json_md
+                                tool_args = _json_md.loads(arg_text)
+                            except Exception:
+                                pass
+                            if not tool_args:
+                                try:
+                                    import ast as _ast_md
+                                    parsed = _ast_md.literal_eval(arg_text)
+                                    if isinstance(parsed, dict):
+                                        tool_args = parsed
+                                except Exception:
+                                    pass
+                            if not tool_args:
+                                pairs = _re_md.findall(r"['\"]?(\w+)['\"]?\s*:\s*['\"]([^'\"\n,}]*)['\"]", arg_text)
+                                if pairs:
+                                    tool_args = {k.strip(): v.strip() for k, v in pairs}
+                            break
+                    if tool_args:
+                        break
+                # Strategy 2: backtick-quoted keys with values (strip backticks from values)
+                # Format: `key`\n`value`  or  `key`\nvalue
+                if not tool_args:
+                    bk_pairs = _re_md.findall(r'`(\w+)`\s*\n\s*`?(.*?)`?\s*(?=\n|$)', block_text)
+                    if bk_pairs:
+                        tool_args = {k.strip(): v.strip().strip("`") for k, v in bk_pairs}
+                # Map common alias keys
+                if "type" in tool_args and "form_type" not in tool_args:
+                    tool_args["form_type"] = tool_args.pop("type")
+                return ("tool", matched, tool_args, "")
 
         # Check for TOOL: or ANSWER: in the response
         # Some models add preamble before the keyword
@@ -602,12 +819,20 @@ class HuggingFaceAgent(BaseAgent):
                 answer = resp[idx + len(marker):].strip()
                 return ("answer", "", {}, answer)
 
-        # If response is short and looks like an answer (not a plan), treat as answer
-        if len(resp) < 200 and not any(x in resp.lower()[:30] for x in
-            ["i need", "let me", "i should", "i will", "next", "i must", "first"]):
+        # If response is short and looks like a direct answer (not reasoning), treat as answer
+        reasoning_markers = ["i need", "let me", "i should", "i will", "next",
+            "i must", "first", "the user", "the question", "i can see",
+            "i also need", "now i", "i will look", "i should look"]
+        is_reasoning = any(x in resp.lower()[:50] for x in reasoning_markers)
+
+        if not is_reasoning and len(resp) < 200:
             return ("answer", "", {}, resp)
 
-        # If it looks like planning, force an answer from what we have
+        # If it looks like reasoning/planning, return continue to keep the loop going
+        if is_reasoning:
+            return ("continue", "", {}, resp)
+
+        # Default: treat as answer
         return ("answer", "", {}, resp)
 
     def solve(self, task) -> AgentResult:
@@ -650,6 +875,11 @@ class HuggingFaceAgent(BaseAgent):
                 conversation, TOOL_SCHEMA
             )
 
+            if action_type == "continue":
+                # Model is still reasoning — add to conversation and continue loop
+                conversation.append({"role": "assistant", "content": final_answer})
+                conversation.append({"role": "user", "content": "Continue. Use TOOL: to call a tool, or ANSWER: to give your final answer."})
+                continue
             if action_type == "answer":
                 steps.append(TrajectoryStep(
                     step=len(steps) + 1,
@@ -666,7 +896,12 @@ class HuggingFaceAgent(BaseAgent):
 
                 t_start = time.time()
                 try:
-                    tool_out = tool_fn(**tool_args)
+                    # Filter tool_args to only accepted params (drop extras like 'ticker')
+                    import inspect as _ins
+                    sig = _ins.signature(tool_fn)
+                    valid_params = set(sig.parameters.keys())
+                    filtered_args = {k: v for k, v in tool_args.items() if k in valid_params}
+                    tool_out = tool_fn(**filtered_args)
                 except Exception as e:
                     tool_out = f"Tool error: {e}"
                 latency = (time.time() - t_start) * 1000
@@ -689,14 +924,17 @@ class HuggingFaceAgent(BaseAgent):
                 break
         else:
             # Max steps reached — generate answer from collected context
-            context = "\n\n".join(context_parts)[:3000]
+            context = "\n\n".join(context_parts)[:6000]
             messages = [
                 {"role": "system", "content": "You are a financial analysis assistant. "
-                  "Based ONLY on the provided context, answer the question directly. "
-                  "Give the exact number, name, or description. "
-                  "Do NOT say you need more information. "
-                  "If the context contains the answer, state it clearly. "
-                  "If you truly cannot find it, say: Not found in the retrieved documents."},
+                  "Based ONLY on the provided context, answer the question directly.\n"
+                  "CRITICAL formatting rules:\n"
+                  "- Output ONLY the factual answer (numbers, names, or direct statements).\n"
+                  "- Do NOT prefix with 'The question asks' or 'Let me' or any reasoning.\n"
+                  "- Do NOT include reasoning steps in the answer.\n"
+                  "- If the answer is a number, give the number with unit.\n"
+                  "- If qualitative, state the fact directly.\n"
+                  "- If you cannot find the answer, say: Not found in the retrieved documents."},
                 {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {task.prompt}\n\nAnswer:"},
             ]
             try:

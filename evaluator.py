@@ -156,118 +156,50 @@ def _rubric_coverage(row: dict, threshold: float = None) -> str:
 # Tier 3: LLM-as-Judge scoring (uses HF router API)
 # ======================================================================
 
-_judge_client = None
 
-def _get_judge_client():
-    """I lazily create an OpenAI client for LLM-as-Judge via HF router."""
-    global _judge_client
-    if _judge_client is None:
-        import os
-        token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
-        if not token:
-            return None
-        from openai import OpenAI
-        _judge_client = OpenAI(
-            base_url="https://router.huggingface.co/v1",
-            api_key=token,
-        )
-    return _judge_client
+def _normalize_answer(s: str) -> str:
+    """I normalize an answer string for robust comparison:
+    - lowercase, strip whitespace
+    - remove commas, dollar signs, percent signs, parentheses
+    - remove common units (million, billion, etc.)
+    - collapse multiple spaces
+    """
+    s = str(s).strip().lower()
+    for ch in ["\$", "€", "£", "¥", ",", "(", ")", "%"]:
+        s = s.replace(ch, " ")
+    for unit in ["million", "billion", "trillion", "thousand", "mn", "bn", "mm"]:
+        s = s.replace(unit, " ")
+    s = " ".join(s.split())
+    return s
 
-def _llm_judge_row(row: dict, judge_model: str = "deepseek-ai/DeepSeek-V4-Flash") -> str:
-    """I use an LLM to judge whether the answer satisfies each rubric criterion.
-    For each 'correctness' criterion I ask the judge: does the answer satisfy this?
-    For each 'contradiction' criterion I ask: does the answer contradict this?
-    I return one of the existing 6 labels."""
-    client = _get_judge_client()
-    if client is None:
-        # No token -> fall back to tier 2
-        return _rubric_coverage(row)
 
+def _extract_all_numbers(s: str) -> list:
+    """I extract all numbers from a string, handling commas and units."""
+    s = str(s).replace(",", "")
+    matches = re.findall(r"-?\d+\.?\d*", s)
+    nums = []
+    for m in matches:
+        try:
+            nums.append(float(m))
+        except ValueError:
+            pass
+    return nums
+
+
+def _is_fab_row(row: dict) -> bool:
+    """I check if a row is a FAB question (has rubric_structured or fab_ prefix)."""
+    task_id = str(row.get("task_id", ""))
     metadata = row.get("metadata", {})
     if isinstance(metadata, str):
         try:
             metadata = json.loads(metadata)
         except (json.JSONDecodeError, TypeError):
             metadata = {}
+    return task_id.startswith("fab_") or bool(metadata.get("rubric_structured"))
 
-    structured = metadata.get("rubric_structured", [])
-    if not structured:
-        return classify_error(row)
-
-    pred = str(row.get("final_answer", "")).strip()
-    if not pred:
-        return "qualitative_incomplete"
-
-    question = str(row.get("prompt", ""))
-    correctness = [c for c in structured if c.get("operator") == "correctness"]
-    contradictions = [c for c in structured if c.get("operator") == "contradiction"]
-
-    if not correctness:
-        return classify_error(row)
-
-    hit = 0
-    for c in correctness:
-        crit = c.get("criteria", "").strip()
-        if not crit:
-            continue
-        try:
-            prompt = (
-                f"You are an expert financial evaluator. "
-                f"Judge whether the given answer satisfies the criterion. "
-                f"Reply ONLY with YES or NO.\n\n"
-                f"Question: {question}\n\n"
-                f"Answer: {pred}\n\n"
-                f"Criterion: {crit}\n\n"
-                f"Does the answer satisfy this criterion? YES or NO:"
-            )
-            resp = client.chat.completions.create(
-                model=judge_model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=4,
-            )
-            verdict = (resp.choices[0].message.content or "").strip().upper()
-            if verdict.startswith("YES"):
-                hit += 1
-        except Exception as e:
-            logger.warning(f"LLM judge failed for criterion '{crit[:30]}': {e}")
-
-    # Check contradictions (if any contradiction is present, answer is wrong)
-    for c in contradictions:
-        crit = c.get("criteria", "").strip()
-        if not crit:
-            continue
-        try:
-            prompt = (
-                f"You are an expert financial evaluator. "
-                f"Does the answer contradict the given statement? "
-                f"Reply ONLY with YES or NO.\n\n"
-                f"Answer: {pred}\n\n"
-                f"Statement: {crit}\n\n"
-                f"Does the answer contradict this? YES or NO:"
-            )
-            resp = client.chat.completions.create(
-                model=judge_model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=4,
-            )
-            verdict = (resp.choices[0].message.content or "").strip().upper()
-            if verdict.startswith("YES"):
-                return "numeric_error" if any(ch.isdigit() for ch in pred) else "qualitative_incomplete"
-        except Exception as e:
-            logger.warning(f"LLM judge contradiction check failed: {e}")
-
-    cov = hit / len(correctness) if correctness else 0
-    if cov >= config.SCORING_RUBRIC_COVERAGE:
-        return "correct"
-
-    gold = str(row.get("gold_answer", ""))
-    if any(ch.isdigit() for ch in gold):
-        return "numeric_error"
-    return "qualitative_incomplete"
 
 def _rubric_coverage_normalized(row: dict) -> bool:
-    """I check rubric criteria using normalized comparison instead of raw substring.
-    This handles case, punctuation, and number format differences."""
+    """I check rubric criteria using normalized comparison. Fallback for T2 when no LLM token."""
     metadata = row.get("metadata", {})
     if isinstance(metadata, str):
         try:
@@ -292,148 +224,367 @@ def _rubric_coverage_normalized(row: dict) -> bool:
         crit = _normalize_answer(c.get("criteria", ""))
         if not crit:
             continue
-        # Check normalized substring
         if crit in pred:
             hit += 1
-        else:
-            # Try numeric match within the criterion
-            crit_nums = _extract_all_numbers(c.get("criteria", ""))
-            pred_nums = _extract_all_numbers(str(row.get("final_answer", "")))
-            if crit_nums and pred_nums:
-                for cn in crit_nums:
-                    for pn in pred_nums:
-                        if cn == 0:
-                            if pn == 0:
-                                hit += 1
-                                break
-                        elif abs(pn - cn) / max(abs(cn), 1e-10) < config.SCORING_NUMERIC_TOLERANCE:
-                            hit += 1
+            continue
+        # Numeric fallback
+        crit_nums = _extract_all_numbers(c.get("criteria", ""))
+        pred_nums = _extract_all_numbers(str(row.get("final_answer", "")))
+        sig_crit = [n for n in crit_nums if not (1900 < n < 2100)]
+        if sig_crit and pred_nums:
+            all_match = True
+            for cn in sig_crit:
+                found = False
+                for pn in pred_nums:
+                    if cn == 0:
+                        if pn == 0:
+                            found = True
                             break
-                    else:
-                        continue
+                    elif abs(pn - cn) / max(abs(cn), 1e-10) < config.SCORING_NUMERIC_TOLERANCE:
+                        found = True
+                        break
+                if not found:
+                    all_match = False
                     break
+            if all_match:
+                hit += 1
 
     cov = hit / len(correctness) if correctness else 0
     return cov >= config.SCORING_RUBRIC_COVERAGE
 
 
-def _is_fab_row(row: dict) -> bool:
-    """I check if a row is a FAB question (has rubric_structured or fab_ prefix)."""
-    task_id = str(row.get("task_id", ""))
+
+_STOPWORDS = {
+    "the", "and", "for", "are", "was", "were", "been", "have", "has", "had",
+    "this", "that", "with", "from", "they", "them", "their", "there", "these",
+    "those", "what", "which", "who", "when", "where", "why", "how", "all",
+    "any", "both", "each", "few", "more", "most", "other", "some", "such",
+    "only", "own", "same", "than", "too", "very", "can", "will", "just",
+    "should", "now", "also", "not", "but", "however", "into", "its",
+}
+
+# ======================================================================
+# Tier 1: Numeric Accuracy (rule-based, deterministic, continuous 0-1)
+# ======================================================================
+
+def _score_t1_numeric(row: dict) -> float:
+    """I check whether the predicted answer contains the core numeric values
+    from the gold answer, within a configurable tolerance.
+    I return a continuous score in [0, 1].
+    I do NOT care about reasoning text — I only look at numbers."""
+    gold_raw = str(row.get("gold_answer", "")).strip()
+    pred_raw = str(row.get("final_answer", "")).strip()
+    if not gold_raw or not pred_raw:
+        return 0.0
+
+    # Extract numbers from gold, filter out years (1900-2100)
+    gold_nums = _extract_all_numbers(gold_raw)
+    sig_gold = [n for n in gold_nums if not (1900 < n < 2100)]
+
+    if not sig_gold:
+        # Text-only answer: fallback to keyword matching (continuous score)
+        # I extract significant keywords from gold and count how many appear in pred
+        gold_norm = _normalize_answer(gold_raw)
+        pred_norm = _normalize_answer(pred_raw)
+
+        # Exact substring match -> full score
+        if gold_norm in pred_norm:
+            return 1.0
+
+        # Keyword coverage: extract significant tokens from gold (len >= 3, not stopwords)
+        gold_tokens = [t for t in gold_norm.split() if len(t) >= 3 and t not in _STOPWORDS]
+        if not gold_tokens:
+            return 0.0
+
+        pred_tokens_set = set(pred_norm.split())
+        matched = sum(1 for t in gold_tokens if t in pred_tokens_set)
+        return matched / len(gold_tokens)
+
+    # Extract numbers from pred
+    pred_nums = _extract_all_numbers(pred_raw)
+    if not pred_nums:
+        return 0.0
+
+    # Count how many significant gold numbers appear in pred
+    matched = 0
+    for gn in sig_gold:
+        for pn in pred_nums:
+            if gn == 0:
+                if pn == 0:
+                    matched += 1
+                    break
+            elif abs(pn - gn) / max(abs(gn), 1e-10) < config.T1_NUMERIC_TOLERANCE:
+                matched += 1
+                break
+
+    return matched / len(sig_gold)
+
+
+# ======================================================================
+# Tier 2: LLM Semantic Judgment (continuous 0-1, with dealbreaker)
+# ======================================================================
+
+_judge_client = None
+
+def _get_judge_client():
+    """I lazily create an OpenAI client for LLM judge via HF router."""
+    global _judge_client
+    if _judge_client is None:
+        import os
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+        if not token:
+            return None
+        from openai import OpenAI
+        _judge_client = OpenAI(
+            base_url="https://router.huggingface.co/v1",
+            api_key=token,
+        )
+    return _judge_client
+
+
+def _format_trajectory_summary(row: dict, max_chars: int = None) -> str:
+    """I extract a compact summary of the agent trajectory for the LLM judge.
+    I include tool names, inputs, and key observations, truncated to max_chars."""
+    if max_chars is None:
+        max_chars = config.T2_MAX_TRAJECTORY_CHARS
+
+    traj = row.get("trajectory", [])
+    if not traj:
+        return "[no trajectory]"
+
+    parts = []
+    total_len = 0
+    for step in traj:
+        step_num = step.get("step", "?")
+        tool = step.get("tool_name", "")
+        tool_input = str(step.get("tool_input", ""))[:200]
+        obs = str(step.get("observation", ""))[:300]
+        thought = str(step.get("thought", ""))[:100]
+
+        if tool:
+            entry = f"Step {step_num}: Called {tool}({tool_input}) -> {obs}"
+        else:
+            entry = f"Step {step_num}: {thought}"
+        parts.append(entry)
+        total_len += len(entry)
+        if total_len > max_chars:
+            break
+
+    result = "\n".join(parts)
+    return result[:max_chars]
+
+
+def _llm_judge_correctness_single(row: dict, criteria_list: list,
+                                         question: str, pred: str,
+                                         traj_summary: str) -> float:
+    """I run ONE LLM judge call and return the score (0-1)."""
+    client = _get_judge_client()
+    if client is None:
+        return 0.0
+
+    numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(criteria_list))
+
+    prompt = (
+        f"You are an expert financial evaluator.\n"
+        f"Judge whether the answer satisfies EACH criterion below.\n"
+        f"IMPORTANT: The answer may contain reasoning text (e.g., 'The question asks...').\n"
+        f"Ignore the reasoning prefix — focus on whether the factual content satisfies each criterion.\n"
+        f"Consider the agent retrieved evidence in the trajectory.\n"
+        f"Reply with ONLY a comma-separated list of YES/NO (one per criterion).\n"
+        f"Example: YES,NO,YES,YES,NO\n\n"
+        f"Question: {question}\n\n"
+        f"Agent Trajectory (retrieved evidence):\n{traj_summary}\n\n"
+        f"Answer: {pred[:2000]}\n\n"
+        f"Criteria:\n{numbered}\n\n"
+        f"Verdicts (comma-separated YES/NO):"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=config.T2_JUDGE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100,
+            temperature=config.T2_TEMPERATURE,
+        )
+        verdict_text = (resp.choices[0].message.content or "").strip().upper()
+        verdicts = [v.strip() for v in verdict_text.split(",")]
+        hit = sum(1 for v in verdicts[:len(criteria_list)] if v.startswith("YES"))
+        return hit / len(criteria_list)
+    except Exception as e:
+        logger.warning(f"LLM judge correctness batch failed: {e}")
+        return 0.0
+
+
+def _llm_judge_correctness(row: dict) -> float:
+    """I use an LLM to judge correctness criteria with multi-vote (3 rounds).
+    I run the judge 3 times and take the MEDIAN score to reduce variance.
+    I batch ALL correctness criteria into ONE prompt per round (3 API calls total).
+    I return a continuous score in [0, 1]."""
+    client = _get_judge_client()
+    if client is None:
+        # No token: fall back to rubric coverage as approximation
+        return 1.0 if _rubric_coverage_normalized(row) else 0.0
+
     metadata = row.get("metadata", {})
     if isinstance(metadata, str):
         try:
             metadata = json.loads(metadata)
         except (json.JSONDecodeError, TypeError):
             metadata = {}
-    return task_id.startswith("fab_") or bool(metadata.get("rubric_structured"))
+
+    structured = metadata.get("rubric_structured", [])
+    if not structured:
+        return 0.5  # No rubric: neutral, let T1 decide
+
+    pred = str(row.get("final_answer", "")).strip()
+    if not pred:
+        return 0.0
+
+    question = str(row.get("prompt", ""))
+    correctness = [c for c in structured if c.get("operator") == "correctness"]
+
+    if not correctness:
+        return 0.5  # No correctness criteria: neutral
+
+    criteria_list = [c.get("criteria", "").strip() for c in correctness
+                     if c.get("criteria", "").strip()]
+    if not criteria_list:
+        return 0.0
+
+    traj_summary = _format_trajectory_summary(row)
+
+    # Multi-vote: run 3 times and take median
+    n_votes = 3
+    scores = []
+    for _ in range(n_votes):
+        s = _llm_judge_correctness_single(row, criteria_list, question, pred, traj_summary)
+        scores.append(s)
+
+    # Median: sort and pick middle
+    scores.sort()
+    median_score = scores[len(scores) // 2]
+    return median_score
 
 
-def _normalize_answer(s: str) -> str:
-    """I normalize an answer string for robust comparison:
-    - lowercase, strip whitespace
-    - remove commas, dollar signs, percent signs, parentheses
-    - remove common units (million, billion, etc.)
-    - collapse multiple spaces
-    """
-    s = str(s).strip().lower()
-    for ch in ["$", "€", "£", "¥", ",", "(", ")", "%"]:
-        s = s.replace(ch, " ")
-    for unit in ["million", "billion", "trillion", "thousand", "mn", "bn", "mm"]:
-        s = s.replace(unit, " ")
-    s = " ".join(s.split())
-    return s
-
-
-def _extract_all_numbers(s: str) -> list:
-    """I extract all numbers from a string, handling commas and units."""
-    import re
-    s = str(s).replace(",", "")
-    matches = re.findall(r"-?\d+\.?\d*", s)
-    nums = []
-    for m in matches:
-        try:
-            nums.append(float(m))
-        except ValueError:
-            pass
-    return nums
-
-
-def _score_tier1_exact(row: dict) -> bool:
-    """Tier 1: I check if gold_answer and final_answer match after normalization.
-    For numeric answers: compare values within tight tolerance (0.1%).
-    For text answers: check if normalized gold is substring of normalized pred.
-    This is stricter than T2/T3 but more robust than raw substring match."""
-    gold_raw = str(row.get("gold_answer", "")).strip()
-    pred_raw = str(row.get("final_answer", "")).strip()
-    if not gold_raw or not pred_raw:
+def _llm_judge_dealbreaker_single(row: dict, contra_list: list,
+                                        pred: str) -> bool:
+    """I run ONE dealbreaker check. Return True if any contradiction is YES."""
+    client = _get_judge_client()
+    if client is None:
         return False
 
-    gold_norm = _normalize_answer(gold_raw)
-    pred_norm = _normalize_answer(pred_raw)
+    numbered_contra = "\n".join(f"{i+1}. {c}" for i, c in enumerate(contra_list))
 
-    # Try numeric comparison first
-    gold_nums = _extract_all_numbers(gold_raw)
-    pred_nums = _extract_all_numbers(pred_raw)
+    prompt = (
+        f"You are an expert financial fact-checker.\n"
+        f"Does the answer CONTRADICT any statement below?\n"
+        f"If the answer states something opposite to a statement, reply YES for that.\n"
+        f"If the answer is silent or agrees, reply NO.\n"
+        f"IMPORTANT: Ignore reasoning prefixes in the answer. Focus on factual claims.\n"
+        f"Reply with ONLY a comma-separated list of YES/NO.\n\n"
+        f"Answer: {pred[:2000]}\n\n"
+        f"Statements (all must be true):\n{numbered_contra}\n\n"
+        f"Contradiction verdicts (comma-separated YES/NO):"
+    )
 
-    if gold_nums and pred_nums:
-        for gn in gold_nums:
-            for pn in pred_nums:
-                if gn == 0:
-                    if pn == 0:
-                        return True
-                elif abs(pn - gn) / max(abs(gn), 1e-10) < 0.001:
-                    return True
-
-    # Fall back to normalized substring match
-    return gold_norm in pred_norm
-
-
-def _score_tier2_numeric(row: dict) -> bool:
-    """Tier 2: I extract numbers from gold and pred, check if they match within tolerance.
-    For FAB: use rubric substring matching with normalized comparison.
-    For non-FAB: use numeric tolerance (config.SCORING_NUMERIC_TOLERANCE)."""
-    if _is_fab_row(row):
-        # For FAB: use rubric coverage with normalized substring match
-        return _rubric_coverage_normalized(row)
-    # For mini benchmark: use numeric tolerance
-    return classify_error(row) == "correct"
+    try:
+        resp = client.chat.completions.create(
+            model=config.T2_JUDGE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=50,
+            temperature=config.T2_TEMPERATURE,
+        )
+        contra_text = (resp.choices[0].message.content or "").strip().upper()
+        contra_verdicts = [v.strip() for v in contra_text.split(",")]
+        return any(v.startswith("YES") for v in contra_verdicts[:len(contra_list)])
+    except Exception as e:
+        logger.warning(f"LLM judge dealbreaker check failed: {e}")
+        return False
 
 
-def _score_tier3_llm_judge(row: dict) -> bool:
-    """Tier 3: I use an LLM judge to evaluate semantic correctness.
-    This is the most lenient -- it catches semantic matches that exact/numeric miss."""
-    if _is_fab_row(row):
-        return _llm_judge_row(row) == "correct"
-    # For non-FAB: fall back to tier 2
-    return _score_tier2_numeric(row)
+def _llm_judge_dealbreaker(row: dict) -> bool:
+    """I check if the answer contradicts any dealbreaker statement.
+    I run 3 times and use majority vote (2/3) to reduce variance.
+    If YES on any contradiction criterion (in majority of rounds), dealbreaker triggered.
+    I return True if a dealbreaker is triggered (score should be 0)."""
+    metadata = row.get("metadata", {})
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
 
+    structured = metadata.get("rubric_structured", [])
+    contradictions = [c for c in structured if c.get("operator") == "contradiction"]
+
+    if not contradictions:
+        return False
+
+    pred = str(row.get("final_answer", "")).strip()
+    if not pred:
+        return False
+
+    contra_list = [c.get("criteria", "").strip() for c in contradictions
+                   if c.get("criteria", "").strip()]
+    if not contra_list:
+        return False
+
+    # Multi-vote: run 3 times, majority (>=2) triggers dealbreaker
+    n_votes = 3
+    triggered_count = 0
+    for _ in range(n_votes):
+        if _llm_judge_dealbreaker_single(row, contra_list, pred):
+            triggered_count += 1
+    return triggered_count >= 2
+
+
+def _score_t2_llm_semantic(row: dict) -> tuple:
+    """I run the LLM semantic judge with dealbreaker check.
+    I return (score: float, dealbreaker_triggered: bool).
+    If dealbreaker triggers, score = 0.0."""
+    # Step 1: Check dealbreakers (contradictions)
+    dealbreaker = _llm_judge_dealbreaker(row)
+    if dealbreaker:
+        return (0.0, True)
+
+    # Step 2: Score correctness criteria
+    score = _llm_judge_correctness(row)
+    return (score, False)
+
+
+# ======================================================================
+# Final score aggregation
+# ======================================================================
 
 def _label_row_tiered(row: dict) -> dict:
-    """I run all 3 tiers and return a dict with per-tier results + final error_type.
-    The final is_correct = any tier passed. The tier breakdown is diagnostic:
-      - tier1 pass + tier2 pass + tier3 pass -> perfect
-      - tier1 fail + tier2 fail + tier3 pass  -> format compliance issue (semantic match)
-      - tier1 fail + tier2 fail + tier3 fail -> genuine knowledge gap
-    """
-    t1 = _score_tier1_exact(row)
-    t2 = _score_tier2_numeric(row)
-    t3 = _score_tier3_llm_judge(row)
+    """I run T1 (numeric) and T2 (LLM semantic) and aggregate the final score.
+    final_score = max(T1, T2), unless dealbreaker triggers (then 0).
+    I return continuous scores + final pass/fail + error type."""
+    t1_score = _score_t1_numeric(row)
+    t2_score, dealbreaker = _score_t2_llm_semantic(row)
 
-    # Determine final error_type (keep existing 6 labels, no new ones)
-    if t1 or t2 or t3:
-        error_type = "correct"
-    elif _is_fab_row(row):
-        gold = str(row.get("gold_answer", ""))
-        error_type = "numeric_error" if any(ch.isdigit() for ch in gold) else "qualitative_incomplete"
+    # Dealbreaker override: if T2 detected a contradiction, force 0
+    if dealbreaker:
+        final_score = 0.0
+        error_type = "factual_contradiction"
     else:
-        error_type = classify_error(row)
+        final_score = max(t1_score, t2_score)
+        # Determine error type
+        if final_score >= config.FINAL_PASS_THRESHOLD:
+            error_type = "correct"
+        elif t1_score == 0 and t2_score == 0:
+            error_type = "complete_failure"
+        elif t1_score > 0 and t1_score < config.FINAL_PASS_THRESHOLD:
+            error_type = "numeric_error"
+        else:
+            error_type = "qualitative_incomplete"
 
     return {
-        "tier1_exact": t1,
-        "tier2_numeric": t2,
-        "tier3_llm_judge": t3,
-        "is_correct": t1 or t2 or t3,
+        "tier1_numeric": t1_score,
+        "tier2_llm_semantic": t2_score,
+        "dealbreaker_triggered": dealbreaker,
+        "final_score": final_score,
+        "is_correct": final_score >= config.FINAL_PASS_THRESHOLD,
         "error_type": error_type,
     }
 
@@ -475,18 +626,20 @@ class Evaluator:
         for r in rows:
             try:
                 tiered = _label_row_tiered(r)
-                r["tier1_exact"] = tiered["tier1_exact"]
-                r["tier2_numeric"] = tiered["tier2_numeric"]
-                r["tier3_llm_judge"] = tiered["tier3_llm_judge"]
+                r["tier1_numeric"] = round(tiered["tier1_numeric"], 4)
+                r["tier2_llm_semantic"] = round(tiered["tier2_llm_semantic"], 4)
+                r["dealbreaker_triggered"] = tiered["dealbreaker_triggered"]
+                r["final_score"] = round(tiered["final_score"], 4)
                 r["is_correct"] = tiered["is_correct"]
                 r["error_type"] = tiered["error_type"]
             except Exception as e:
                 logger.warning(f"Scoring failed for {r.get('task_id', '?')}: {e}")
                 r["error_type"] = "qualitative_incomplete"
                 r["is_correct"] = False
-                r["tier1_exact"] = False
-                r["tier2_numeric"] = False
-                r["tier3_llm_judge"] = False
+                r["tier1_numeric"] = 0.0
+                r["tier2_llm_semantic"] = 0.0
+                r["dealbreaker_triggered"] = False
+                r["final_score"] = 0.0
             scored.append(r)
 
         self.results = scored
@@ -495,7 +648,8 @@ class Evaluator:
         out_csv = self.output_dir / "results.csv"
         fields = ["run_id", "task_id", "category", "difficulty", "gold_answer",
                   "final_answer", "is_correct", "error_type",
-                  "tier1_exact", "tier2_numeric", "tier3_llm_judge",
+                  "tier1_numeric", "tier2_llm_semantic", "dealbreaker_triggered",
+                  "final_score",
                   "tool_calls", "total_latency_ms", "model_name"]
         with out_csv.open("w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -509,10 +663,11 @@ class Evaluator:
         avg_latency = (sum(r.get("total_latency_ms", 0) for r in scored) / n) if n else 0
         total_cost = sum(r.get("total_cost_usd", 0) for r in scored)
 
-        # Tier breakdown (diagnostic: how many passed each tier)
-        t1_pass = sum(1 for r in scored if r.get("tier1_exact"))
-        t2_pass = sum(1 for r in scored if r.get("tier2_numeric"))
-        t3_pass = sum(1 for r in scored if r.get("tier3_llm_judge"))
+        # Tier breakdown (diagnostic: continuous scores)
+        t1_avg = sum(r.get("tier1_numeric", 0) for r in scored) / n if n else 0
+        t2_avg = sum(r.get("tier2_llm_semantic", 0) for r in scored) / n if n else 0
+        final_avg = sum(r.get("final_score", 0) for r in scored) / n if n else 0
+        dealbreakers = sum(1 for r in scored if r.get("dealbreaker_triggered"))
 
         report = {
             "n_tasks": n,
@@ -521,15 +676,17 @@ class Evaluator:
             "avg_latency_ms": round(avg_latency, 1),
             "total_cost_usd": round(total_cost, 4),
             "tier_breakdown": {
-                "tier1_exact": t1_pass,
-                "tier2_numeric": t2_pass,
-                "tier3_llm_judge": t3_pass,
+                "t1_numeric_avg": round(t1_avg, 4),
+                "t2_llm_semantic_avg": round(t2_avg, 4),
+                "final_score_avg": round(final_avg, 4),
+                "dealbreakers_triggered": dealbreakers,
             },
         }
 
-        print("\n=== Evaluation Report ===")
-        print(f"Accuracy: {correct}/{n} = {report['accuracy']:.2%}")
-        print(f"Tier breakdown: T1(exact)={t1_pass}  T2(numeric/rubric)={t2_pass}  T3(LLM-judge)={t3_pass}")
+        print("\n=== Evaluation Report (v2.0 — continuous scoring) ===")
+        print(f"Accuracy: {correct}/{n} = {report['accuracy']:.2%} (threshold={config.FINAL_PASS_THRESHOLD})")
+        print(f"Avg scores: T1(numeric)={t1_avg:.3f}  T2(LLM-semantic)={t2_avg:.3f}  Final={final_avg:.3f}")
+        print(f"Dealbreakers triggered: {dealbreakers}/{n}")
         print("Error distribution:", dict(errors))
         print(f"Avg latency: {report['avg_latency_ms']} ms  |  Total cost: ${report['total_cost_usd']}")
         print(f"Detailed results: {out_csv}")

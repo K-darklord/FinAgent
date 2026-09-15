@@ -630,16 +630,17 @@ class FinGPTAgent(BaseAgent):
 
 
 class HuggingFaceAgent(BaseAgent):
-    """HuggingFace Inference API agent via OpenAI-compatible router.
-    I call remote models on HF infrastructure, so I need no local model download.
-    I use inclusionAI/Ling-3.0-flash-Fin by default (a financial LLM).
+    """HuggingFace Inference API agent using native function calling.
+    I call remote models on HF infrastructure via OpenAI-compatible router.
+    I use native function calling (tools parameter) instead of ReAct text format.
+    This eliminates format parsing errors and lets each model use its trained interface.
     I need HF_TOKEN env var (free at https://huggingface.co/settings/tokens).
     I support any model from https://router.huggingface.co/v1/models via HF_MODEL env var."""
 
     name = "hf-agent"
 
     def __init__(self, model: str = None, token: str = None, max_tokens: int = 1024):
-        self.model = model or os.getenv("HF_MODEL", "inclusionAI/Ling-3.0-flash-Fin")
+        self.model = model or os.getenv("HF_MODEL", "deepseek-ai/DeepSeek-V4-Flash")
         self.token = token or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
         self.max_tokens = max_tokens
         self._client = None
@@ -654,15 +655,66 @@ class HuggingFaceAgent(BaseAgent):
             )
         return self._client
 
-    def _generate(self, messages: list, max_retries: int = 3) -> str:
-        """I call the HF router chat completions endpoint (OpenAI-compatible).
-        I set temperature=0 for reproducible outputs.
-        I retry on connection/timeout errors with exponential backoff (1s, 2s, 4s).
-        I raise after max_retries to let caller handle the failure."""
+    def _build_fc_tools(self):
+        """I convert TOOL_SCHEMA to OpenAI function-calling format.
+        This is the same format used by OpenAIAgent — shared tools, different interface."""
+        tools = []
+        for t in TOOL_SCHEMA:
+            params = {"type": "object", "properties": {}}
+            required = []
+            for pname, pdesc in t.get("parameters", {}).items():
+                ptype = "integer" if "offset" in pname or "max" in pname else "string"
+                params["properties"][pname] = {"type": ptype, "description": pdesc}
+                if "REQUIRED" in pdesc or "required" in pdesc.lower():
+                    required.append(pname)
+            if required:
+                params["required"] = required
+            tools.append({"type": "function", "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": params,
+            }})
+        return tools
+
+    def _call_llm_with_tools(self, messages, tools, tool_choice="auto"):
+        """I call the HF router with native function calling support.
+        I retry on transient errors with exponential backoff."""
         import time as _time
         client = self._get_client()
         last_error = None
-        for attempt in range(max_retries):
+        for attempt in range(3):
+            try:
+                resp = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    max_tokens=self.max_tokens,
+                    temperature=0,
+                )
+                return resp
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                is_transient = any(k in err_str for k in [
+                    "timeout", "timed out", "connection error",
+                    "connection reset", "connection refused",
+                    "service unavailable", "internal server error",
+                    "rate limit", "overloaded", "temporarily unavailable"
+                ])
+                if not is_transient or attempt == 2:
+                    raise
+                wait = 2 ** attempt
+                _time.sleep(wait)
+        raise last_error
+
+    def _call_llm_text(self, messages):
+        """I call the HF router for text generation (no tools, for fallback).
+        Used when max_steps is reached and we need to synthesize from context."""
+        import time as _time
+        client = self._get_client()
+        last_error = None
+        for attempt in range(3):
             try:
                 resp = client.chat.completions.create(
                     model=self.model,
@@ -674,36 +726,210 @@ class HuggingFaceAgent(BaseAgent):
             except Exception as e:
                 last_error = e
                 err_str = str(e).lower()
-                # Retry on connection/timeout errors
                 is_transient = any(k in err_str for k in [
                     "timeout", "timed out", "connection error",
                     "connection reset", "connection refused",
                     "service unavailable", "internal server error",
                     "rate limit", "overloaded", "temporarily unavailable"
                 ])
-                if not is_transient or attempt == max_retries - 1:
+                if not is_transient or attempt == 2:
                     raise
-                wait = 2 ** attempt  # 1s, 2s, 4s
+                wait = 2 ** attempt
                 _time.sleep(wait)
         raise last_error
 
-    def _extract_search_query(self, prompt: str) -> str:
-        """I extract a concise EDGAR search query from the task prompt.
-        I look for company name and key financial terms."""
-        import re as _re
-        # Remove question words and keep the substantive content
-        clean = _re.sub(r'(?i)\b(what|how|when|where|which|did|does|is|are|was|were|the|a|an|for|of|in|on|at|to|from|by|with|and|or|not|please|describe|briefly|summarize|calculate|explain|list)\b', ' ', prompt)
-        clean = ' '.join(clean.split())
-        # Limit length for URL safety
-        return clean[:120].strip()
+    def solve(self, task) -> AgentResult:
+        result = AgentResult(task_id=task.task_id, model_name=self.model)
+        t0 = time.time()
+        steps: list[TrajectoryStep] = []
+        import json as _json
+        import inspect as _ins
 
-    def _react_step(self, messages: list, available_tools: list) -> tuple:
-        """I call the LLM and parse its response for tool calls or final answers.
-        I return (action_type, tool_name, tool_args, final_answer).
-        I handle common format violations gracefully."""
+        fc_tools = self._build_fc_tools()
+
         system_msg = (
             "You are a financial research agent. You have access to tools:\n"
-            + "\n".join(f"- {t['name']}: {t['description']}" for t in available_tools)
+            + "\n".join(f"- {t['name']}: {t['description']}" for t in TOOL_SCHEMA)
+            + "\n\nUse tools to find the answer. When you have enough information, "
+            "respond with the final answer directly (no tool call needed).\n"
+            "CRITICAL formatting rules:\n"
+            "- The answer must contain ONLY the factual answer (numbers, names, or direct statements).\n"
+            "- Do NOT include any reasoning or preamble.\n"
+            "- If the answer is a number, give the number with unit.\n"
+            "- If qualitative, state the fact directly.\n"
+            "- If you cannot find the answer, say: Not found in the retrieved documents."
+        )
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": task.prompt},
+        ]
+
+        context_parts = []
+        step_num = 1
+        max_steps = config.MAX_TOOL_CALLS_PER_TASK
+
+        for iteration in range(max_steps):
+            try:
+                resp = self._call_llm_with_tools(messages, fc_tools, tool_choice="auto")
+            except Exception as e:
+                err_str = str(e).lower()
+                is_api_failure = any(k in err_str for k in [
+                    "timeout", "timed out", "connection error",
+                    "connection reset", "connection refused",
+                    "service unavailable", "rate limit", "overloaded",
+                    "temporarily unavailable", "402", "credits", "depleted",
+                    "payment", "billing"
+                ])
+                result.api_failure = is_api_failure
+                result.final_answer = f"LLM error: {e}"
+                steps.append(TrajectoryStep(
+                    step=step_num,
+                    thought="LLM API failure.",
+                    observation=result.final_answer[:300],
+                ))
+                break
+
+            msg = resp.choices[0].message
+
+            # Check if model wants to call tools
+            if msg.tool_calls:
+                messages.append(msg)
+                for tc in msg.tool_calls:
+                    tool_name = tc.function.name
+                    try:
+                        args = _json.loads(tc.function.arguments)
+                    except Exception:
+                        args = {}
+
+                    tool_fn = TOOLS.get(tool_name)
+                    if not tool_fn:
+                        messages.append({"role": "tool", "tool_call_id": tc.id,
+                                        "content": f"Tool {tool_name} not found."})
+                        continue
+
+                    t_start = time.time()
+                    try:
+                        sig = _ins.signature(tool_fn)
+                        valid_params = set(sig.parameters.keys())
+                        filtered_args = {k: v for k, v in args.items() if k in valid_params}
+                        tool_out = tool_fn(**filtered_args)
+                    except Exception as e:
+                        tool_out = f"Tool error: {e}"
+                    latency = (time.time() - t_start) * 1000
+
+                    steps.append(TrajectoryStep(
+                        step=step_num,
+                        thought=f"LLM called {tool_name} with {args}",
+                        tool_name=tool_name,
+                        tool_input=args,
+                        tool_output=str(tool_out)[:2000],
+                        observation=f"retrieved {len(str(tool_out))} chars",
+                        latency_ms=round(latency, 1),
+                    ))
+                    step_num += 1
+                    context_parts.append(str(tool_out)[:8000])
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": str(tool_out)[:8000],
+                    })
+            else:
+                # No tool calls -> model gave final answer
+                answer = msg.content or ""
+                answer = _strip_reasoning_prefix(answer)
+                result.final_answer = answer
+                steps.append(TrajectoryStep(
+                    step=step_num,
+                    thought="LLM produced final answer.",
+                    observation=answer[:300],
+                ))
+                break
+        else:
+            # Max steps reached but model didn't give answer (shouldn't happen with tool_choice=none on last step)
+            # Generate from context as fallback
+            context = "\n\n".join(context_parts)[:8000]
+            fallback_msgs = [
+                {"role": "system", "content": "You are a financial analysis assistant. "
+                  "Based ONLY on the provided context, answer the question directly.\n"
+                  "CRITICAL formatting rules:\n"
+                  "- Output ONLY the factual answer (numbers, names, or direct statements).\n"
+                  "- Do NOT include any reasoning or preamble.\n"
+                  "- If the answer is a number, give the number with unit.\n"
+                  "- If qualitative, state the fact directly.\n"
+                  "- If you cannot find the answer, say: Not found in the retrieved documents."},
+                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {task.prompt}\n\nAnswer:"},
+            ]
+            try:
+                answer = self._call_llm_text(fallback_msgs)
+            except Exception as e:
+                result.api_failure = True
+                answer = f"[max steps reached, LLM error: {e}]"
+            answer = _strip_reasoning_prefix(answer)
+            result.final_answer = answer
+            steps.append(TrajectoryStep(
+                step=step_num,
+                thought="Max steps reached; generating answer from collected context.",
+                tool_name="fallback_generate",
+                observation=answer[:300],
+            ))
+
+        # Assemble result
+        result.trajectory = [asdict(s) for s in steps]
+        result.tool_calls = sum(1 for s in steps if s.tool_name and s.tool_name != "fallback_generate")
+        result.total_latency_ms = int((time.time() - t0) * 1000)
+        result.total_cost_usd = 0.0  # HF router doesn't report token usage in free tier
+        return result
+
+
+class OpenAIAgent(BaseAgent):
+    """Real LLM agent via OpenAI-compatible API using native function calling.
+    I share the same TOOLS and TOOL_SCHEMA as HuggingFaceAgent — same tools,
+    different calling interface (native function calling vs text-based ReAct).
+    This ensures fair comparison: same tools, same eval framework, different models."""
+
+    name = "openai-agent"
+
+    def __init__(self, model: str = None, api_key: str = None, base_url: str = None):
+        from openai import OpenAI
+        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        key = api_key or config.OPENAI_API_KEY
+        url = base_url or os.getenv("OPENAI_BASE_URL", None)
+        self.client = OpenAI(api_key=key, base_url=url) if url else OpenAI(api_key=key)
+
+    def _build_openai_tools(self):
+        """Convert shared TOOL_SCHEMA to OpenAI function-calling format."""
+        tools = []
+        for t in TOOL_SCHEMA:
+            params = {"type": "object", "properties": {}}
+            required = []
+            for pname, pdesc in t.get("parameters", {}).items():
+                ptype = "integer" if "offset" in pname or "max" in pname else "string"
+                params["properties"][pname] = {"type": ptype, "description": pdesc}
+                if "REQUIRED" in pdesc or "required" in pdesc.lower():
+                    required.append(pname)
+            if required:
+                params["required"] = required
+            tools.append({"type": "function", "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": params,
+            }})
+        return tools
+
+    def solve(self, task) -> AgentResult:
+        result = AgentResult(task_id=task.task_id, model_name=self.model)
+        t0 = time.time()
+        steps: list[TrajectoryStep] = []
+        import json as _json
+
+        # Build tools from shared TOOL_SCHEMA (same as HuggingFaceAgent)
+        openai_tools = self._build_openai_tools()
+
+        # System prompt: same fair-evaluation principles as HuggingFaceAgent
+        system_msg = (
+            "You are a financial research agent. You have access to tools:\n"
+            + "\n".join(f"- {t['name']}: {t['description']}" for t in TOOL_SCHEMA)
             + "\n\nTo use a tool, respond with EXACTLY this format:\n"
             "TOOL: <tool_name>\nARGS: {\"key\": \"value\"}\n\n"
             "Format examples (use placeholder values — replace with actual content):\n"
@@ -715,478 +941,133 @@ class HuggingFaceAgent(BaseAgent):
             "IMPORTANT formatting rules:\n"
             "- ANSWER must contain ONLY the factual answer (numbers, names, or direct statements).\n"
             "- Do NOT include any reasoning or preamble in the ANSWER.\n"
-            "- Do NOT include intermediate reasoning in the ANSWER line.\n"
             "- If the answer is a number, give the number (with unit if applicable).\n"
-            "- If the answer is qualitative, state it directly (e.g., 'Workday reports Gross Revenue Retention Rate').\n"
+            "- If the answer is qualitative, state it directly.\n"
             "- Reasoning steps belong in TOOL calls (before the ANSWER), NOT in the ANSWER itself."
         )
-        all_messages = [{"role": "system", "content": system_msg}] + messages
-        try:
-            resp = self._generate(all_messages)
-        except Exception as e:
-            err_str = str(e).lower()
-            is_api_failure = any(k in err_str for k in [
-                "timeout", "timed out", "connection error",
-                "connection reset", "connection refused",
-                "service unavailable", "internal server error",
-                "rate limit", "overloaded", "temporarily unavailable"
-            ])
-            return ("api_error" if is_api_failure else "error", "", {}, f"LLM error: {e}")
 
-        resp = resp.strip()
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": task.prompt},
+        ]
 
-
-        # Try XML-style tool call format first:
-        # Some models use <tool_call>name<arg_key>key</arg_key><arg_value>val</arg_value></tool_call>
-        import re as _re_xml
-        valid_tools = {t["name"] for t in available_tools}
-        _xml_block_pat = r'<tool_call>(\w+)\s*\n(.*?)</tool_call>'
-        xml_blocks = _re_xml.findall(_xml_block_pat, resp, flags=_re_xml.DOTALL)
-        if xml_blocks:
-            for tool_name_raw, block_text in xml_blocks:
-                tool_name = tool_name_raw.strip().lower()
-                matched = tool_name if tool_name in valid_tools else None
-                if not matched:
-                    for vt in valid_tools:
-                        if vt in tool_name or tool_name in vt:
-                            matched = vt
-                            break
-                if not matched:
-                    continue
-                _xml_arg_pat = r'<arg_key>(\w+)</arg_key>\s*<arg_value>(.*?)</arg_value>'
-                arg_pairs = _re_xml.findall(_xml_arg_pat, block_text, flags=_re_xml.DOTALL)
-                tool_args = {k.strip(): v.strip() for k, v in arg_pairs} if arg_pairs else {}
-                if "type" in tool_args and "form_type" not in tool_args:
-                    tool_args["form_type"] = tool_args.pop("type")
-                return ("tool", matched, tool_args, "")
-
-        # Fallback: incomplete XML tags (no closing tag)
-        # Some models output  only open tag with no close.
-        _xml_open_pat = r'<tool_call>(\w+)\s*\n(.*?)(?=<tool_call>|$)'
-        xml_open_blocks = _re_xml.findall(_xml_open_pat, resp, flags=_re_xml.DOTALL)
-        if xml_open_blocks:
-            for tool_name_raw, block_text in xml_open_blocks:
-                tool_name = tool_name_raw.strip().lower()
-                matched = tool_name if tool_name in valid_tools else None
-                if not matched:
-                    for vt in valid_tools:
-                        if vt in tool_name or tool_name in vt:
-                            matched = vt
-                            break
-                if not matched:
-                    continue
-                # Try arg_key/arg_value pairs first
-                _xml_arg_pat = r'<arg_key>(\w+)</arg_key>\s*<arg_value>(.*?)</arg_value>'
-                arg_pairs = _re_xml.findall(_xml_arg_pat, block_text, flags=_re_xml.DOTALL)
-                tool_args = {k.strip(): v.strip() for k, v in arg_pairs} if arg_pairs else {}
-                # If no arg_key pairs, try ARGS: {json} format
-                if not tool_args:
-                    import re as _re_fb
-                    m = _re_fb.search(r'ARGS:\s*(.*)', block_text, flags=_re_fb.DOTALL)
-                    if m:
-                        arg_text = m.group(1).strip()
-                        try:
-                            import json as _json_fb
-                            tool_args = _json_fb.loads(arg_text)
-                        except Exception:
-                            pass
-                        if not tool_args:
-                            try:
-                                import ast as _ast_fb
-                                parsed = _ast_fb.literal_eval(arg_text)
-                                if isinstance(parsed, dict):
-                                    tool_args = parsed
-                            except Exception:
-                                pass
-                        if not tool_args:
-                            pairs = _re_fb.findall(r'[\'\"]?(\w+)[\'\"]?\s*:\s*[\'\"]([^\'\"]*)[\'\"]', arg_text)
-                            if pairs:
-                                tool_args = {k.strip(): v.strip() for k, v in pairs}
-                if 'type' in tool_args and 'form_type' not in tool_args:
-                    tool_args['form_type'] = tool_args.pop('type')
-                if tool_args or matched:
-                    return ('tool', matched, tool_args, '')
-
-        # Try markdown code block format. Models use several variants:
-        #   A) ```tool_name\nARGS: {json}```  (tool name on fence line)
-        #   B) ```\ntool_name\nARGS: {json}```  (tool name on next line)
-        #   C) ```\ntool_name\n`key`\n`value`  (backtick-quoted key-value pairs)
-        import re as _re_md
-        # Match opening fence, optional tool name, block content, closing fence
-        md_blocks = _re_md.findall(r'```(\w+)?\s*\n(.*?)```', resp, flags=_re_md.DOTALL)
-        if md_blocks:
-            for tool_name_raw, block_text in md_blocks:
-                # If tool name not on fence line, extract from first line of block
-                tool_name = (tool_name_raw or "").strip().lower()
-                if not tool_name:
-                    lines_bk = block_text.strip().split("\n")
-                    if lines_bk:
-                        tool_name = lines_bk[0].strip().lower()
-                        block_text = "\n".join(lines_bk[1:])
-                # Skip non-tool code blocks
-                if tool_name in ("python", "json", "javascript", "bash", "sh", "text", "yaml"):
-                    continue
-                # Accept exact or fuzzy match
-                matched = tool_name if tool_name in valid_tools else None
-                if not matched:
-                    for vt in valid_tools:
-                        if vt in tool_name or tool_name in vt:
-                            matched = vt
-                            break
-                if not matched:
-                    continue
-                # Strategy 1: parse ARGS: {json} from block
-                tool_args = {}
-                for line in block_text.split("\n"):
-                    for arg_marker in ["ARGS:", "args:", "Args:"]:
-                        if arg_marker in line:
-                            arg_text = line[line.index(arg_marker) + len(arg_marker):].strip()
-                            tool_args = {}
-                            try:
-                                import json as _json_md
-                                tool_args = _json_md.loads(arg_text)
-                            except Exception:
-                                pass
-                            if not tool_args:
-                                try:
-                                    import ast as _ast_md
-                                    parsed = _ast_md.literal_eval(arg_text)
-                                    if isinstance(parsed, dict):
-                                        tool_args = parsed
-                                except Exception:
-                                    pass
-                            if not tool_args:
-                                pairs = _re_md.findall(r"['\"]?(\w+)['\"]?\s*:\s*['\"]([^'\"\n,}]*)['\"]", arg_text)
-                                if pairs:
-                                    tool_args = {k.strip(): v.strip() for k, v in pairs}
-                            break
-                    if tool_args:
-                        break
-                # Strategy 2: backtick-quoted keys with values (strip backticks from values)
-                # Format: `key`\n`value`  or  `key`\nvalue
-                if not tool_args:
-                    bk_pairs = _re_md.findall(r'`(\w+)`\s*\n\s*`?(.*?)`?\s*(?=\n|$)', block_text)
-                    if bk_pairs:
-                        tool_args = {k.strip(): v.strip().strip("`") for k, v in bk_pairs}
-                # Map common alias keys
-                if "type" in tool_args and "form_type" not in tool_args:
-                    tool_args["form_type"] = tool_args.pop("type")
-                return ("tool", matched, tool_args, "")
-
-        # Check for TOOL: or ANSWER: in the response
-        # Some models add preamble before the keyword
-        for marker in ["TOOL:", "tool:", "Tool:"]:
-            if marker in resp:
-                idx = resp.index(marker)
-                rest = resp[idx + len(marker):].strip()
-                lines = rest.split("\n")
-                tool_name = lines[0].strip().lower()
-                tool_args = {}
-                for line in lines[1:]:
-                    for arg_marker in ["ARGS:", "args:", "Args:"]:
-                        if arg_marker in line:
-                            arg_text = line[line.index(arg_marker) + len(arg_marker):].strip()
-                            tool_args = {}
-                            # Try JSON first
-                            try:
-                                import json as _json
-                                tool_args = _json.loads(arg_text)
-                            except Exception:
-                                pass
-                            # Try Python dict literal (ast.literal_eval is safe)
-                            if not tool_args:
-                                try:
-                                    import ast
-                                    parsed = ast.literal_eval(arg_text)
-                                    if isinstance(parsed, dict):
-                                        tool_args = parsed
-                                except Exception:
-                                    pass
-                            # Try regex extraction of key-value pairs
-                            if not tool_args:
-                                import re as _re
-                                # Match patterns like: 'query': 'value' or query: value
-                                pairs = _re.findall(r"['\"]?(\w+)['\"]?\s*:\s*['\"]([^'\"]*)['\"]", arg_text)
-                                if pairs:
-                                    tool_args = {k.strip(): v.strip() for k, v in pairs}
-                            # Last resort: extract the content as query
-                            if not tool_args and arg_text:
-                                # Strip wrappers: {, }, ', ", query:
-                                cleaned = arg_text.strip("{}\"\' ")
-                                # Remove leading "query:" if present
-                                cleaned = _re.sub(r"^(query|url)\s*[:\"]\s*", "", cleaned, flags=_re.I)
-                                cleaned = cleaned.strip("\"\' ")
-                                if cleaned:
-                                    # Guess the arg name based on tool
-                                    if "url" in tool_name or "fetch" in tool_name:
-                                        tool_args = {"url": cleaned}
-                                    else:
-                                        tool_args = {"query": cleaned}
-                            break
-                # Validate tool name
-                valid_tools = {t["name"] for t in available_tools}
-                if tool_name in valid_tools:
-                    return ("tool", tool_name, tool_args, "")
-                # Try fuzzy match
-                for vt in valid_tools:
-                    if vt in tool_name or tool_name in vt:
-                        return ("tool", vt, tool_args, "")
-
-        for marker in ["ANSWER:", "answer:", "Answer:"]:
-            if marker in resp:
-                idx = resp.index(marker)
-                answer = _strip_reasoning_prefix(resp[idx + len(marker):].strip())
-                return ("answer", "", {}, answer)
-
-        # If response is short and looks like a direct answer (not reasoning), treat as answer
-        reasoning_markers = ["i need", "let me", "i should", "i will", "next",
-            "i must", "first", "the user", "the question", "i can see",
-            "i also need", "now i", "i will look", "i should look"]
-        is_reasoning = any(x in resp.lower()[:50] for x in reasoning_markers)
-
-        if not is_reasoning and len(resp) < 200:
-            return ("answer", "", {}, _strip_reasoning_prefix(resp))
-
-        # If it looks like reasoning/planning, return continue to keep the loop going
-        if is_reasoning:
-            return ("continue", "", {}, resp)
-
-        # Default: treat as answer
-        return ("answer", "", {}, _strip_reasoning_prefix(resp))
-
-    def solve(self, task) -> AgentResult:
-        """I use a ReAct-style loop: search EDGAR, parse results, then answer.
-        For FAB questions without evidence URLs, I proactively search EDGAR."""
-        result = AgentResult(task_id=task.task_id, model_name=self.model)
-        t0 = time.time()
-        steps: list[TrajectoryStep] = []
-        max_steps = config.MAX_TOOL_CALLS
-
-        # Step 1: Plan
-        steps.append(TrajectoryStep(
-            step=1,
-            thought="Plan: search EDGAR for relevant filings, parse content, then answer.",
-        ))
-
-        # Step 2: Fetch evidence URLs if provided
         context_parts = []
-        for url in task.evidence:
-            t_start = time.time()
-            out = fetch_url(url)
-            latency = (time.time() - t_start) * 1000
-            steps.append(TrajectoryStep(
-                step=len(steps) + 1,
-                thought="Use fetch_url to retrieve the source document.",
-                tool_name="fetch_url",
-                tool_input={"url": url},
-                tool_output=out[:2000],
-                observation="retrieved snippet" if "stub" not in out else "fetch fallback",
-                latency_ms=round(latency, 1),
-            ))
-            context_parts.append(out[:8000])
+        step_num = 1
+        total_tokens = 0
+        max_steps = config.MAX_TOOL_CALLS_PER_TASK
 
-        # Step 3: ReAct loop — search EDGAR, parse, retrieve
-        search_query = self._extract_search_query(task.prompt)
-        conversation = [{"role": "user", "content": task.prompt}]
-
-        for i in range(max_steps):
-            action_type, tool_name, tool_args, final_answer = self._react_step(
-                conversation, TOOL_SCHEMA
-            )
-
-            if action_type == "continue":
-                # Model is still reasoning — add to conversation and continue loop
-                conversation.append({"role": "assistant", "content": final_answer})
-                conversation.append({"role": "user", "content": "Continue. Use TOOL: to call a tool, or ANSWER: to give your final answer."})
-                continue
-            if action_type == "answer":
+        for iteration in range(max_steps):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model, messages=messages, tools=openai_tools,
+                    tool_choice="auto" if iteration < max_steps - 1 else "none",
+                )
+                msg = resp.choices[0].message
+                total_tokens += resp.usage.total_tokens
+            except Exception as e:
+                err_str = str(e).lower()
+                is_api_failure = any(k in err_str for k in [
+                    "timeout", "timed out", "connection error",
+                    "connection reset", "rate limit", "service unavailable",
+                ])
+                result.api_failure = is_api_failure
+                result.final_answer = f"LLM error: {e}"
                 steps.append(TrajectoryStep(
-                    step=len(steps) + 1,
-                    thought="LLM produced final answer.",
-                    observation=final_answer[:300],
-                ))
-                result.final_answer = final_answer
-                break
-            if action_type == "api_error":
-                # API failure (timeout/connection) — mark and stop
-                result.api_failure = True
-                result.final_answer = final_answer
-                steps.append(TrajectoryStep(
-                    step=len(steps) + 1,
+                    step=step_num,
                     thought="LLM API failure (timeout/connection).",
-                    observation=final_answer[:300],
+                    observation=result.final_answer[:300],
                 ))
                 break
-            elif action_type == "tool":
-                tool_fn = TOOLS.get(tool_name)
-                if not tool_fn:
-                    conversation.append({"role": "assistant", "content": f"Tool {tool_name} not found."})
-                    continue
 
-                t_start = time.time()
-                try:
-                    # Filter tool_args to only accepted params (drop extras like 'ticker')
-                    import inspect as _ins
-                    sig = _ins.signature(tool_fn)
-                    valid_params = set(sig.parameters.keys())
-                    filtered_args = {k: v for k, v in tool_args.items() if k in valid_params}
-                    tool_out = tool_fn(**filtered_args)
-                except Exception as e:
-                    tool_out = f"Tool error: {e}"
-                latency = (time.time() - t_start) * 1000
+            # If the model wants to call tools, execute them
+            if msg.tool_calls:
+                messages.append(msg)
+                for tc in msg.tool_calls:
+                    tool_name = tc.function.name
+                    try:
+                        args = _json.loads(tc.function.arguments)
+                    except Exception:
+                        args = {}
 
-                steps.append(TrajectoryStep(
-                    step=len(steps) + 1,
-                    thought=f"LLM called {tool_name} with {tool_args}",
-                    tool_name=tool_name,
-                    tool_input=tool_args,
-                    tool_output=str(tool_out)[:2000],
-                    observation=f"retrieved {len(str(tool_out))} chars",
-                    latency_ms=round(latency, 1),
-                ))
-                context_parts.append(str(tool_out)[:8000])
-                conversation.append({"role": "assistant", "content": f"TOOL: {tool_name}\nARGS: {tool_args}"})
-                conversation.append({"role": "user", "content": f"Result: {str(tool_out)[:8000]}"})
+                    tool_fn = TOOLS.get(tool_name)
+                    if not tool_fn:
+                        messages.append({"role": "tool", "tool_call_id": tc.id,
+                                        "content": f"Tool {tool_name} not found."})
+                        continue
+
+                    t_start = time.time()
+                    try:
+                        import inspect as _ins
+                        sig = _ins.signature(tool_fn)
+                        valid_params = set(sig.parameters.keys())
+                        filtered_args = {k: v for k, v in args.items() if k in valid_params}
+                        tool_out = tool_fn(**filtered_args)
+                    except Exception as e:
+                        tool_out = f"Tool error: {e}"
+                    latency = (time.time() - t_start) * 1000
+
+                    steps.append(TrajectoryStep(
+                        step=step_num,
+                        thought=f"LLM called {tool_name} with {args}",
+                        tool_name=tool_name,
+                        tool_input=args,
+                        tool_output=str(tool_out)[:2000],
+                        observation=f"retrieved {len(str(tool_out))} chars",
+                        latency_ms=round(latency, 1),
+                    ))
+                    step_num += 1
+                    context_parts.append(str(tool_out)[:8000])
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": str(tool_out)[:8000],
+                    })
             else:
-                conversation.append({"role": "assistant", "content": final_answer})
-                result.final_answer = final_answer
+                # No tool calls -> model gave final answer
+                answer = msg.content or ""
+                answer = _strip_reasoning_prefix(answer)
+                result.final_answer = answer
+                steps.append(TrajectoryStep(
+                    step=step_num,
+                    thought="LLM produced final answer.",
+                    observation=answer[:300],
+                ))
                 break
         else:
-            # Max steps reached — generate answer from collected context
+            # Max steps reached — generate answer from context (same as HuggingFaceAgent)
             context = "\n\n".join(context_parts)[:8000]
-            messages = [
+            fallback_msgs = [
                 {"role": "system", "content": "You are a financial analysis assistant. "
                   "Based ONLY on the provided context, answer the question directly.\n"
                   "CRITICAL formatting rules:\n"
                   "- Output ONLY the factual answer (numbers, names, or direct statements).\n"
                   "- Do NOT include any reasoning or preamble.\n"
-                  "- Do NOT include reasoning steps in the answer.\n"
                   "- If the answer is a number, give the number with unit.\n"
                   "- If qualitative, state the fact directly.\n"
                   "- If you cannot find the answer, say: Not found in the retrieved documents."},
                 {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {task.prompt}\n\nAnswer:"},
             ]
             try:
-                answer = self._generate(messages)
+                fb_resp = self.client.chat.completions.create(
+                    model=self.model, messages=fallback_msgs)
+                answer = fb_resp.choices[0].message.content or ""
+                total_tokens += fb_resp.usage.total_tokens
             except Exception as e:
                 result.api_failure = True
                 answer = f"[max steps reached, LLM error: {e}]"
             answer = _strip_reasoning_prefix(answer)
+            result.final_answer = answer
             steps.append(TrajectoryStep(
-                step=len(steps) + 1,
+                step=step_num,
                 thought="Max steps reached; generating answer from collected context.",
+                tool_name="fallback_generate",
                 observation=answer[:300],
             ))
-            result.final_answer = answer
 
         # Assemble result
         result.trajectory = [asdict(s) for s in steps]
-        result.tool_calls = sum(1 for s in steps if s.tool_name)
+        result.tool_calls = sum(1 for s in steps if s.tool_name and s.tool_name != "fallback_generate")
         result.total_latency_ms = int((time.time() - t0) * 1000)
-        result.total_cost_usd = 0.0
-        return result
-
-class OpenAIAgent(BaseAgent):
-    """Real LLM agent via OpenAI-compatible API. I support tool-calling (fetch_url)
-    and record full trajectory. I need pip install openai + API key in config.py.
-    I also work with local vLLM (set base_url in config)."""
-
-    name = "openai-agent"
-
-    def __init__(self, model: str = None, api_key: str = None, base_url: str = None):
-        from openai import OpenAI
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        key = api_key or config.OPENAI_API_KEY
-        url = base_url or os.getenv("OPENAI_BASE_URL", None)
-        self.client = OpenAI(api_key=key, base_url=url) if url else OpenAI(api_key=key)
-
-    def solve(self, task) -> AgentResult:
-        result = AgentResult(task_id=task.task_id, model_name=self.model)
-        t0 = time.time()
-        steps: list[TrajectoryStep] = []
-        import json as _json
-
-        # I build the conversation with system prompt + user question
-        messages = [
-            {"role": "system", "content": "You are a financial research agent. "
-              "Answer the question concisely and accurately. "
-              "If evidence URLs are provided, use the fetch_url tool to retrieve them. "
-              "Cite the source when possible."},
-            {"role": "user", "content": task.prompt},
-        ]
-
-        # I define the fetch_url tool for the API
-        tools = [{"type": "function", "function": {
-            "name": "fetch_url",
-            "description": TOOL_SCHEMA[0]["description"],
-            "parameters": {"type": "object", "properties": {
-                "url": {"type": "string", "description": "URL to fetch"}},
-                "required": ["url"]},
-        }}]
-
-        # I run the tool-calling loop (max MAX_TOOL_CALLS_PER_TASK iterations)
-        step_num = 1
-        total_tokens = 0
-        steps.append(TrajectoryStep(
-            step=step_num,
-            thought="Plan: use LLM to answer the question, calling fetch_url if evidence URLs are available.",
-        ))
-        step_num += 1
-
-        for iteration in range(config.MAX_TOOL_CALLS_PER_TASK):
-            resp = self.client.chat.completions.create(
-                model=self.model, messages=messages, tools=tools)
-            msg = resp.choices[0].message
-            total_tokens += resp.usage.total_tokens
-
-            # If the model wants to call tools, execute them
-            if msg.tool_calls:
-                messages.append(msg)
-                for tc in msg.tool_calls:
-                    if tc.function.name == "fetch_url":
-                        args = _json.loads(tc.function.arguments)
-                        t_start = time.time()
-                        out = fetch_url(args.get("url", ""))
-                        latency = (time.time() - t_start) * 1000
-                        steps.append(TrajectoryStep(
-                            step=step_num,
-                            thought="LLM called fetch_url to retrieve evidence.",
-                            tool_name="fetch_url",
-                            tool_input=args,
-                            tool_output=out[:2000],
-                            observation="retrieved snippet",
-                            latency_ms=round(latency, 1),
-                        ))
-                        step_num += 1
-                        # I feed the tool result back to the model
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": out[:2000],
-                        })
-            else:
-                # No tool calls -> model gave final answer
-                break
-        else:
-            # I hit the max iterations; force a final answer
-            resp = self.client.chat.completions.create(
-                model=self.model, messages=messages)
-            msg = resp.choices[0].message
-            total_tokens += resp.usage.total_tokens
-
-        # I record the final synthesis step
-        result.final_answer = msg.content or ""
-        steps.append(TrajectoryStep(
-            step=step_num,
-            thought="Synthesize evidence into final answer via LLM.",
-            observation=result.final_answer,
-        ))
-
-        # I assemble the result
-        result.trajectory = [asdict(s) for s in steps]
-        result.tool_calls = sum(1 for s in steps if s.tool_name)
-        result.total_latency_ms = int((time.time() - t0) * 1000)
-        # I estimate cost: gpt-4o-mini is ~$0.15/M input + $0.60/M output
         result.total_cost_usd = round(total_tokens / 1e6 * 0.30, 4)
         return result
 

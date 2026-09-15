@@ -34,6 +34,12 @@ HF_MODEL = os.getenv("HF_MODEL", "deepseek-ai/DeepSeek-V4-Flash")
 HF_JUDGE_MODEL = os.getenv("HF_JUDGE_MODEL", "deepseek-ai/DeepSeek-V4-Flash")
 HF_BASE_URL = "https://router.huggingface.co/v1"
 
+# Model variants for comparison (baseline stays as V4-Flash)
+HF_MODEL_V4_FLASH = "deepseek-ai/DeepSeek-V4-Flash"      # baseline (284B/13B active)
+HF_MODEL_V4_PRO = "deepseek-ai/DeepSeek-V4-Pro"          # upgrade (1.6T/49B active)
+HF_MODEL_V41_FLASH = "deepseek-ai/DeepSeek-V4.1-Flash"   # V4.1 variant
+HF_MODEL_R1 = "deepseek-ai/DeepSeek-R1"                  # reasoning model (CoT)
+
 # ======================================================================
 # Finance Agent Benchmark (FAB) data config
 # ======================================================================

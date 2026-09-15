@@ -19,6 +19,7 @@ import urllib.request
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 import config
+import re
 
 
 # ------------------------- 工具定义 (真实可调用的) -------------------------
@@ -108,14 +109,30 @@ def fetch_url(url: str, timeout: int = 20) -> str:
         return _local_fallback(url)
 
 
-def edgar_search(query: str, form_type: str = "", max_results: int = 5) -> str:
-    """
-    Search SEC EDGAR full-text search for filings matching the query.
+def edgar_search(query: str = "", form_type: str = "", max_results: int = 5, **kwargs) -> str:
+    """Search SEC EDGAR full-text search for filings matching the query.
+    I accept parameter aliases: query, q, company, ticker, url, search_term, term.
+    I also accept form aliases: form_type, form, type, filing_type.
+    I also accept year/date as filtering hints (passed into query).
     I return formatted results with filing URLs and text snippets.
-    I need a User-Agent header per SEC policy.
-    """
+    I need a User-Agent header per SEC policy."""
     import urllib.parse
     import json as _json
+
+    # Resolve parameter aliases
+    if not query:
+        query = (kwargs.get("q") or kwargs.get("company") or 
+                 kwargs.get("ticker") or kwargs.get("url") or
+                 kwargs.get("search_term") or kwargs.get("term") or
+                 kwargs.get("search") or kwargs.get("keyword") or "")
+    if not form_type:
+        form_type = (kwargs.get("form") or kwargs.get("type") or
+                     kwargs.get("filing_type") or "")
+    year = kwargs.get("year") or kwargs.get("date") or ""
+    if year and str(year) not in query:
+        query = f"{query} {year}".strip()
+    if not query:
+        return "Error: no search query provided. Use query= parameter with search terms."
 
     base = "https://efts.sec.gov/LATEST/search-index"
     params_dict = {"q": query}
@@ -170,7 +187,7 @@ def edgar_search(query: str, form_type: str = "", max_results: int = 5) -> str:
         return f"EDGAR search failed: {e}"
 
 
-def parse_html(url: str, timeout: int = 20) -> str:
+def parse_html(url: str, timeout: int = 20, offset: int = 0, max_chars: int = 15000) -> str:
     """
     Fetch a URL and extract clean text from HTML.
     I strip tags, scripts, styles, skip XBRL metadata blocks, and return readable text.
@@ -227,12 +244,12 @@ def parse_html(url: str, timeout: int = 20) -> str:
         text = _re.sub(r"</ix:[^>]*>", " ", text)
         text = " ".join(text.split())
 
-        return text[:15000] if text else "[empty page]"
+        return text[offset:offset+max_chars] if text else "[empty page]"
     except Exception as e:
         return f"parse_html failed: {e}"
 
 
-def retrieve_information(text: str = "", query: str = "", max_chars: int = 1500) -> str:
+def retrieve_information(text: str = "", query: str = "", max_chars: int = 4000) -> str:
     """
     Retrieve relevant sentences from a block of text based on a query.
     I do simple keyword matching: find sentences containing query keywords.
@@ -277,20 +294,89 @@ TOOL_SCHEMA = [
     },
     {
         "name": "edgar_search",
-        "description": "Search SEC EDGAR for company filings. Returns filing URLs and snippets. Use this to find 10-K, 10-Q, 8-K filings.",
-        "parameters": {"query": "string (search terms, e.g. 'NVIDIA revenue 2024')", "form_type": "string (optional: '10-K', '10-Q', '8-K', etc.)"},
+        "description": "Search SEC EDGAR for company filings. Returns filing URLs and snippets. Use this to find 10-K, 10-Q, 8-K filings. The 'query' parameter accepts company name + search terms (e.g. 'NVIDIA revenue 2024'). You may also pass 'form_type' to filter by filing type.",
+        "parameters": {"query": "string (REQUIRED: search terms, e.g. 'NVIDIA 10-K 2024' or 'Apple revenue')", "form_type": "string (optional: '10-K', '10-Q', '8-K', 'DEF 14A', etc.)"},
     },
     {
         "name": "parse_html",
-        "description": "Fetch a URL and extract clean text from HTML, stripping tags and scripts. Use this to read SEC filing pages.",
-        "parameters": {"url": "string (url to parse)"},
+        "description": "Fetch a URL and extract clean text from HTML, stripping tags and scripts. Use this to read SEC filing pages. Supports offset for pagination: if the first call does not contain the answer, call again with offset=15000 to read the next section.",
+        "parameters": {"url": "string (url to parse)", "offset": "int (optional: start reading from this char position, useful for long documents, default 0)", "max_chars": "int (optional: max chars to return, default 15000)"},
     },
     {
         "name": "retrieve_information",
-        "description": "Find relevant sentences from a text block based on keywords in the query. Use this to extract specific data from retrieved documents. IMPORTANT: the text parameter must be the output from a previous fetch_url or parse_html call. Do NOT call this tool without first fetching a document.",
-        "parameters": {"text": "string (the text to search, from previous fetch_url/parse_html output)", "query": "string (what to look for)"},
+        "description": "Find relevant sentences from a text block based on keywords in the query. Use this to extract specific data from retrieved documents. IMPORTANT: the text parameter must be the full output from a previous fetch_url or parse_html call (do NOT truncate it). The query should be the specific information you are looking for (e.g. 'revenue 2024' or 'operating margin'). Returns up to 4000 chars of matching sentences.",
+        "parameters": {"text": "string (the FULL text from previous fetch_url/parse_html output)", "query": "string (the specific information to find, e.g. 'revenue 2024' or 'channel partners')"},
     },
 ]
+
+# ------------------------- Answer cleanup helper -------------------------
+_REASONING_CUES = (
+    "the question", "let me", "i need", "i'll", "i will", "i am going",
+    "i'm going", "based on", "the user", "now i", "i can now",
+    "after analyzing", "after reviewing", "to answer this",
+    "in order to", "to find", "to calculate", "i should", "i must",
+    "allow me", "i have", "i've", "let us", "first i", "to determine",
+    "i want to", "i am trying", "i'm trying",
+    "from the context", "the context includes", "the context provides",
+)
+
+
+def _strip_reasoning_prefix(text: str) -> str:
+    """Strip leading reasoning/preamble from a final answer.
+    For long LLM outputs (>300 chars), extract the last answer-like paragraph.
+    For shorter text, strip up to 4 leading reasoning sentences."""
+    if not text:
+        return text
+    text = text.strip()
+    text = re.sub(r'<[^>]+>', '', text).strip()
+    text = re.sub(r'^(?:TOOL|ARGS):.*$', '', text, flags=re.MULTILINE).strip()
+    text = re.sub(r'^(?:ANSWER|Answer|answer)\s*[:\-]\s*', '', text).strip()
+    original = text
+
+    # Try paragraph extraction first (works for multi-paragraph LLM outputs)
+    if '\n\n' in text or '\n \n' in text:
+        paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+        if len(paragraphs) > 1:
+            for p in reversed(paragraphs):
+                if (re.search(r'\b\d|%|million|billion|\$', p, re.IGNORECASE)
+                        and not any(cue in p.lower()[:50] for cue in _REASONING_CUES)):
+                    return p
+            for p in reversed(paragraphs):
+                if len(p) < 200 and not any(cue in p.lower()[:50] for cue in _REASONING_CUES):
+                    return p
+
+    for _ in range(4):
+        m = re.match(r'^([^.!?\n]*[.!?|:]+\s*)', text, re.IGNORECASE)
+        if not m:
+            break
+        sentence = m.group(1)
+        lower = sentence.lower()
+        if not any(cue in lower for cue in _REASONING_CUES):
+            break
+        # If sentence contains answer-like content, strip only preamble clause.
+        # I exclude filing-type numbers (10-K, 10-Q, 8-K) from the answer check.
+        _cleaned = re.sub(r'\b\d+-[KQkq]\b', '', sentence)
+        if re.search(r'\b\d|%|million|billion|\$', _cleaned, re.IGNORECASE):
+            for pat in [r'^.*?\bthe answer (?:is|was)\s+',
+                        r'^.*?\bi found that\s+',
+                        r'^.*?\bthe result (?:is|was)\s+',
+                        r'^.*?\bthe figure (?:is|was)\s+',
+                        r'^.*?\bi can (?:find|see|identify|extract)\s+',
+                        r'^.*?\bthe (?:data|filing|document) (?:shows|states|indicates|reveals)\s+']:
+                mm = re.match(pat, sentence, re.IGNORECASE)
+                if mm:
+                    text = (sentence[mm.end():] + text[len(sentence):]).strip()
+                    break
+            else:
+                # No known preamble pattern; keep original to avoid losing answer
+                text = original
+                break
+        else:
+            text = text[len(sentence):].strip()
+    if not text.strip() or len(text.strip()) < 15:
+        text = original
+    return text
+
 
 
 # ------------------------- Trajectory / AgentResult -------------------------
@@ -315,6 +401,7 @@ class AgentResult:
     total_cost_usd: float = 0.0
     error: str = ""
     model_name: str = "rule-based-local"
+    api_failure: bool = False  # True if LLM API timed out or connection failed
 
     def to_dict(self):
         d = asdict(self)
@@ -359,7 +446,7 @@ class RuleBasedFinanceAgent(BaseAgent):
                 thought="Use fetch_url to retrieve the annual report.",
                 tool_name="fetch_url",
                 tool_input={"url": url},
-                tool_output=out[:300],   # 只存前 300 字符到 trajectory，避免爆炸
+                tool_output=out[:2000],   # 只存前 300 字符到 trajectory，避免爆炸
                 observation="retrieved snippet" if "tool_error" not in out else "fetch failed",
                 latency_ms=round(latency, 1),
             ))
@@ -499,7 +586,7 @@ class FinGPTAgent(BaseAgent):
                 thought="Use fetch_url to retrieve the source document.",
                 tool_name="fetch_url",
                 tool_input={"url": url},
-                tool_output=out[:300],
+                tool_output=out[:2000],
                 observation="retrieved snippet" if "stub" not in out else "fetch fallback",
                 latency_ms=round(latency, 1),
             ))
@@ -551,7 +638,7 @@ class HuggingFaceAgent(BaseAgent):
 
     name = "hf-agent"
 
-    def __init__(self, model: str = None, token: str = None, max_tokens: int = 256):
+    def __init__(self, model: str = None, token: str = None, max_tokens: int = 1024):
         self.model = model or os.getenv("HF_MODEL", "inclusionAI/Ling-3.0-flash-Fin")
         self.token = token or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
         self.max_tokens = max_tokens
@@ -567,17 +654,38 @@ class HuggingFaceAgent(BaseAgent):
             )
         return self._client
 
-    def _generate(self, messages: list) -> str:
+    def _generate(self, messages: list, max_retries: int = 3) -> str:
         """I call the HF router chat completions endpoint (OpenAI-compatible).
-        I set temperature=0 for reproducible outputs."""
+        I set temperature=0 for reproducible outputs.
+        I retry on connection/timeout errors with exponential backoff (1s, 2s, 4s).
+        I raise after max_retries to let caller handle the failure."""
+        import time as _time
         client = self._get_client()
-        resp = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=self.max_tokens,
-            temperature=0,
-        )
-        return resp.choices[0].message.content or ""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                resp = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=self.max_tokens,
+                    temperature=0,
+                )
+                return resp.choices[0].message.content or ""
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                # Retry on connection/timeout errors
+                is_transient = any(k in err_str for k in [
+                    "timeout", "timed out", "connection error",
+                    "connection reset", "connection refused",
+                    "service unavailable", "internal server error",
+                    "rate limit", "overloaded", "temporarily unavailable"
+                ])
+                if not is_transient or attempt == max_retries - 1:
+                    raise
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                _time.sleep(wait)
+        raise last_error
 
     def _extract_search_query(self, prompt: str) -> str:
         """I extract a concise EDGAR search query from the task prompt.
@@ -597,12 +705,16 @@ class HuggingFaceAgent(BaseAgent):
             "You are a financial research agent. You have access to tools:\n"
             + "\n".join(f"- {t['name']}: {t['description']}" for t in available_tools)
             + "\n\nTo use a tool, respond with EXACTLY this format:\n"
-            "TOOL: <tool_name>\nARGS: {key: value}\n\n"
+            "TOOL: <tool_name>\nARGS: {\"key\": \"value\"}\n\n"
+            "Format examples (use placeholder values — replace with actual content):\n"
+            "TOOL: edgar_search\nARGS: {\"query\": \"<company name> <filing type> <year>\", \"form_type\": \"<10-K|10-Q|8-K>\"}\n\n"
+            "TOOL: parse_html\nARGS: {\"url\": \"<filing URL from edgar_search>\"}\n\n"
+            "TOOL: retrieve_information\nARGS: {\"text\": \"<document text from parse_html>\", \"query\": \"<search terms>\"}\n\n"
             "If you have enough information to answer, respond with:\n"
             "ANSWER: <your final answer>\n\n"
             "IMPORTANT formatting rules:\n"
             "- ANSWER must contain ONLY the factual answer (numbers, names, or direct statements).\n"
-            "- Do NOT prefix the answer with reasoning like 'The question asks' or 'Let me'.\n"
+            "- Do NOT include any reasoning or preamble in the ANSWER.\n"
             "- Do NOT include intermediate reasoning in the ANSWER line.\n"
             "- If the answer is a number, give the number (with unit if applicable).\n"
             "- If the answer is qualitative, state it directly (e.g., 'Workday reports Gross Revenue Retention Rate').\n"
@@ -612,7 +724,14 @@ class HuggingFaceAgent(BaseAgent):
         try:
             resp = self._generate(all_messages)
         except Exception as e:
-            return ("error", "", {}, f"LLM error: {e}")
+            err_str = str(e).lower()
+            is_api_failure = any(k in err_str for k in [
+                "timeout", "timed out", "connection error",
+                "connection reset", "connection refused",
+                "service unavailable", "internal server error",
+                "rate limit", "overloaded", "temporarily unavailable"
+            ])
+            return ("api_error" if is_api_failure else "error", "", {}, f"LLM error: {e}")
 
         resp = resp.strip()
 
@@ -816,7 +935,7 @@ class HuggingFaceAgent(BaseAgent):
         for marker in ["ANSWER:", "answer:", "Answer:"]:
             if marker in resp:
                 idx = resp.index(marker)
-                answer = resp[idx + len(marker):].strip()
+                answer = _strip_reasoning_prefix(resp[idx + len(marker):].strip())
                 return ("answer", "", {}, answer)
 
         # If response is short and looks like a direct answer (not reasoning), treat as answer
@@ -826,14 +945,14 @@ class HuggingFaceAgent(BaseAgent):
         is_reasoning = any(x in resp.lower()[:50] for x in reasoning_markers)
 
         if not is_reasoning and len(resp) < 200:
-            return ("answer", "", {}, resp)
+            return ("answer", "", {}, _strip_reasoning_prefix(resp))
 
         # If it looks like reasoning/planning, return continue to keep the loop going
         if is_reasoning:
             return ("continue", "", {}, resp)
 
         # Default: treat as answer
-        return ("answer", "", {}, resp)
+        return ("answer", "", {}, _strip_reasoning_prefix(resp))
 
     def solve(self, task) -> AgentResult:
         """I use a ReAct-style loop: search EDGAR, parse results, then answer.
@@ -860,11 +979,11 @@ class HuggingFaceAgent(BaseAgent):
                 thought="Use fetch_url to retrieve the source document.",
                 tool_name="fetch_url",
                 tool_input={"url": url},
-                tool_output=out[:300],
+                tool_output=out[:2000],
                 observation="retrieved snippet" if "stub" not in out else "fetch fallback",
                 latency_ms=round(latency, 1),
             ))
-            context_parts.append(out[:1000])
+            context_parts.append(out[:8000])
 
         # Step 3: ReAct loop — search EDGAR, parse, retrieve
         search_query = self._extract_search_query(task.prompt)
@@ -887,6 +1006,16 @@ class HuggingFaceAgent(BaseAgent):
                     observation=final_answer[:300],
                 ))
                 result.final_answer = final_answer
+                break
+            if action_type == "api_error":
+                # API failure (timeout/connection) — mark and stop
+                result.api_failure = True
+                result.final_answer = final_answer
+                steps.append(TrajectoryStep(
+                    step=len(steps) + 1,
+                    thought="LLM API failure (timeout/connection).",
+                    observation=final_answer[:300],
+                ))
                 break
             elif action_type == "tool":
                 tool_fn = TOOLS.get(tool_name)
@@ -911,26 +1040,26 @@ class HuggingFaceAgent(BaseAgent):
                     thought=f"LLM called {tool_name} with {tool_args}",
                     tool_name=tool_name,
                     tool_input=tool_args,
-                    tool_output=str(tool_out)[:300],
+                    tool_output=str(tool_out)[:2000],
                     observation=f"retrieved {len(str(tool_out))} chars",
                     latency_ms=round(latency, 1),
                 ))
-                context_parts.append(str(tool_out)[:1500])
+                context_parts.append(str(tool_out)[:8000])
                 conversation.append({"role": "assistant", "content": f"TOOL: {tool_name}\nARGS: {tool_args}"})
-                conversation.append({"role": "user", "content": f"Result: {str(tool_out)[:1000]}"})
+                conversation.append({"role": "user", "content": f"Result: {str(tool_out)[:8000]}"})
             else:
                 conversation.append({"role": "assistant", "content": final_answer})
                 result.final_answer = final_answer
                 break
         else:
             # Max steps reached — generate answer from collected context
-            context = "\n\n".join(context_parts)[:6000]
+            context = "\n\n".join(context_parts)[:8000]
             messages = [
                 {"role": "system", "content": "You are a financial analysis assistant. "
                   "Based ONLY on the provided context, answer the question directly.\n"
                   "CRITICAL formatting rules:\n"
                   "- Output ONLY the factual answer (numbers, names, or direct statements).\n"
-                  "- Do NOT prefix with 'The question asks' or 'Let me' or any reasoning.\n"
+                  "- Do NOT include any reasoning or preamble.\n"
                   "- Do NOT include reasoning steps in the answer.\n"
                   "- If the answer is a number, give the number with unit.\n"
                   "- If qualitative, state the fact directly.\n"
@@ -940,7 +1069,9 @@ class HuggingFaceAgent(BaseAgent):
             try:
                 answer = self._generate(messages)
             except Exception as e:
+                result.api_failure = True
                 answer = f"[max steps reached, LLM error: {e}]"
+            answer = _strip_reasoning_prefix(answer)
             steps.append(TrajectoryStep(
                 step=len(steps) + 1,
                 thought="Max steps reached; generating answer from collected context.",
@@ -1022,7 +1153,7 @@ class OpenAIAgent(BaseAgent):
                             thought="LLM called fetch_url to retrieve evidence.",
                             tool_name="fetch_url",
                             tool_input=args,
-                            tool_output=out[:300],
+                            tool_output=out[:2000],
                             observation="retrieved snippet",
                             latency_ms=round(latency, 1),
                         ))

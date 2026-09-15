@@ -563,6 +563,18 @@ def _label_row_tiered(row: dict) -> dict:
     t1_score = _score_t1_numeric(row)
     t2_score, dealbreaker = _score_t2_llm_semantic(row)
 
+    # API failure override: if the agent failed due to API timeout/connection,
+    # mark as api_failure and exclude from accuracy denominator
+    if row.get("api_failure", False):
+        return {
+            "tier1_numeric": 0.0,
+            "tier2_llm_semantic": 0.0,
+            "dealbreaker_triggered": False,
+            "final_score": 0.0,
+            "is_correct": False,
+            "error_type": "api_failure",
+        }
+
     # Dealbreaker override: if T2 detected a contradiction, force 0
     if dealbreaker:
         final_score = 0.0
@@ -658,20 +670,28 @@ class Evaluator:
 
         # Build report
         n = len(scored)
+        # Separate API failures from valid tasks
+        n_api_failures = sum(1 for r in scored if r.get("error_type") == "api_failure")
+        n_valid = n - n_api_failures
         correct = sum(1 for r in scored if r.get("is_correct"))
         errors = Counter(r.get("error_type", "unknown") for r in scored)
         avg_latency = (sum(r.get("total_latency_ms", 0) for r in scored) / n) if n else 0
         total_cost = sum(r.get("total_cost_usd", 0) for r in scored)
 
-        # Tier breakdown (diagnostic: continuous scores)
-        t1_avg = sum(r.get("tier1_numeric", 0) for r in scored) / n if n else 0
-        t2_avg = sum(r.get("tier2_llm_semantic", 0) for r in scored) / n if n else 0
-        final_avg = sum(r.get("final_score", 0) for r in scored) / n if n else 0
-        dealbreakers = sum(1 for r in scored if r.get("dealbreaker_triggered"))
+        # Tier breakdown (diagnostic: continuous scores) — exclude api_failures
+        valid_scored = [r for r in scored if r.get("error_type") != "api_failure"]
+        vn = len(valid_scored) if valid_scored else 1
+        t1_avg = sum(r.get("tier1_numeric", 0) for r in valid_scored) / vn
+        t2_avg = sum(r.get("tier2_llm_semantic", 0) for r in valid_scored) / vn
+        final_avg = sum(r.get("final_score", 0) for r in valid_scored) / vn
+        dealbreakers = sum(1 for r in valid_scored if r.get("dealbreaker_triggered"))
 
         report = {
             "n_tasks": n,
+            "n_valid_tasks": n_valid,
+            "n_api_failures": n_api_failures,
             "accuracy": correct / n if n else 0,
+            "accuracy_excl_api_failures": correct / n_valid if n_valid else 0,
             "error_distribution": dict(errors),
             "avg_latency_ms": round(avg_latency, 1),
             "total_cost_usd": round(total_cost, 4),
@@ -685,6 +705,8 @@ class Evaluator:
 
         print("\n=== Evaluation Report (v2.0 — continuous scoring) ===")
         print(f"Accuracy: {correct}/{n} = {report['accuracy']:.2%} (threshold={config.FINAL_PASS_THRESHOLD})")
+        if n_api_failures > 0:
+            print(f"Accuracy (excl. {n_api_failures} API failures): {correct}/{n_valid} = {report['accuracy_excl_api_failures']:.2%}")
         print(f"Avg scores: T1(numeric)={t1_avg:.3f}  T2(LLM-semantic)={t2_avg:.3f}  Final={final_avg:.3f}")
         print(f"Dealbreakers triggered: {dealbreakers}/{n}")
         print("Error distribution:", dict(errors))
@@ -736,13 +758,18 @@ class Evaluator:
             self._load_results()
 
         n = len(self.results)
+        n_api = sum(1 for r in self.results if r.get("error_type") == "api_failure")
+        n_valid = n - n_api
         correct = sum(1 for r in self.results if self._is_correct(r))
         accuracy = correct / n if n else 0.0
+        accuracy_valid = correct / n_valid if n_valid else 0.0
 
         print("\n=== Basic Stats ===")
-        print(f"Total tasks : {n}")
+        print(f"Total tasks : {n} (excl. {n_api} API failures: {n_valid} valid)")
         print(f"Correct     : {correct}")
-        print(f"Accuracy    : {accuracy:.2%}")
+        print(f"Accuracy    : {accuracy:.2%} (all tasks)")
+        if n_api > 0:
+            print(f"Accuracy    : {accuracy_valid:.2%} (excl. API failures)")
 
         # By category
         cats = {}

@@ -276,3 +276,49 @@ These are documented limitations, not bugs. They will be addressed as research n
 | 2.0 | 2026-09-13 | Merge to 2-tier: T1 numeric (continuous), T2 LLM semantic (continuous + dealbreaker). Remove T3. |
 | 2.1 | 2026-09-13 | T1 keyword matching fallback for non-numeric gold. T2 multi-vote (3 rounds, median/majority). Judge prompt: ignore reasoning prefixes. Agent prompt: enforce ANSWER-only format. |
 | 2.1-doc | 2026-09-13 | Document 7 known limitations (Section 8). No code changes. |
+| 2.2 | 2026-09-15 | Fair evaluation principles (Section 9). API retry + api_failure flag. Abstract placeholders in ReAct prompt. |
+
+---
+
+## 9. Fair Evaluation Principles
+
+**Goal**: Ensure the evaluation measures LLM's intrinsic ability, not artifacts of the test harness.
+
+### 9.1 Three Core Principles
+
+#### P1: Non-Interference (不干扰)
+The test harness must NOT compensate for LLM's tool-calling deficiencies.
+
+- **Removed**: `auto-recovery` logic that auto-filled empty `edgar_search` params from task prompt.
+- **Rationale**: Auto-recovery masked LLM's inability to generate correct tool parameters. If LLM passes empty `{}` as tool args, that IS the LLM's ability gap — the evaluator must not hide it.
+- **What we keep**: Parameter alias resolution (`q`/`company`/`ticker` -> `query`) is API design best practice, not interference. Real-world APIs accept aliases.
+
+#### P2: Non-Guidance (不引导)
+Tool-call examples in the ReAct prompt must use abstract placeholders, not concrete content.
+
+- **Before (biased)**: `ARGS: {"query": "NVIDIA 10-K 2024", ...}` — may bias LLM toward searching NVIDIA or using "10-K 2024" pattern.
+- **After (neutral)**: `ARGS: {"query": "<company name> <filing type> <year>", ...}` — shows format only, no content hint.
+- **Rationale**: Concrete examples create priming effects. LLM may mimic example content instead of constructing query from the actual task. Abstract placeholders give format documentation without content guidance — like API docs for human developers.
+
+#### P3: Non-Attribution (不归咎)
+Transient infrastructure failures must NOT count against LLM's ability score.
+
+- **API retry mechanism**: 3 retries with exponential backoff (1s, 2s, 4s) for timeout/connection/rate-limit errors.
+- **`api_failure` flag**: If all retries fail, the task is marked `api_failure` and excluded from accuracy denominator.
+- **Rationale**: Network timeouts and API rate limits are infrastructure issues, not LLM reasoning failures. The evaluator reports two accuracies:
+  - `Accuracy (all tasks)`: includes API failures as 0
+  - `Accuracy (excl. API failures)`: excludes API failures from denominator
+
+### 9.2 Summary Table
+
+| Principle | What it means | Implementation |
+|-----------|---------------|----------------|
+| Non-Interference | Don't help LLM fill params | Removed auto-recovery |
+| Non-Guidance | Don't hint at search content | Abstract placeholders |
+| Non-Attribution | Don't penalize infra failures | API retry + api_failure flag |
+
+### 9.3 What This Does NOT Mean
+
+- We do NOT remove all error handling. Tool parameter aliases and syntax-tolerant parsing remain — these are API robustness, not LLM assistance.
+- We do NOT remove the API retry mechanism. Retry handles transient failures, not LLM reasoning gaps.
+- We do NOT remove the fallback path (max_steps exhausted -> generate answer from context). Fallback tests LLM's ability to synthesize from partial information.

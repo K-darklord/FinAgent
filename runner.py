@@ -54,6 +54,7 @@ def run_evaluation(
                 "model_name": result.model_name,
                 "trajectory": result.trajectory,   # 完整轨迹：归因分析的原料
                 "metadata": task.metadata,
+                "api_failure": result.api_failure,
             }
             ft.write(json.dumps(record, ensure_ascii=False) + "\n")
 

@@ -1,7 +1,7 @@
 # Interference Causal Comparison Table
 
-**Last Updated**: 2026-09-16
-**Git Tag**: v3-interference-fix-60pct
+**Last Updated**: 2026-09-16 (50-task full validation)
+**Git Tag**: v3-interference-fix-60pct (5-task) → 50-task full run confirmed 48%
 
 ---
 
@@ -28,7 +28,7 @@
 
 | ID | Interference | Type | Before (Version) | Accuracy Before | After (Version) | Accuracy After | Delta (pp) | Evidence |
 |---|---|---|---|---|---|---|---|---|
-| INT-14 | Tool design vs FC paradigm | Tool Design | v1-native-fc (5 tasks) | 40% | v3-interference-fix (5 tasks) | 60% | **+20pp** | RI: 0%→95%, fab_001: Not found→correct |
+| INT-14 | Tool design vs FC paradigm | Tool Design | v1-native-fc (5 tasks) | 40% | v3-interference-fix (50 tasks) | 48% | **+8pp** | RI: 0→305/305 (100%), 50-task full validation |
 | INT-01 | ReAct format tax | Format | v0-ReAct (V4-Pro) | 8.3% | v0-FC (FAB official) | 60.39% | **+52.09pp** | Same model, 7x gap |
 | INT-02 | Negative example priming | Prompt | v0 (50 tasks) | 16% | v1 removed (50 tasks) | 34% | **+18pp** | Accuracy regressed 34%→16% when bad examples added |
 | INT-03 | Fallback "ONE LINE ONLY" | Hyperparam | v0 (50 tasks) | 30% | v1 relaxed (50 tasks) | 34% | **+4pp** | Overly restrictive prompt truncated info |
@@ -43,7 +43,7 @@
 ## 3. Interference by Category
 
 ### 3.1 Tool Design Interference (Highest Impact)
-- **INT-14** (+20pp): Tool design incompatible with calling paradigm
+- **INT-14** (+8pp on 50 tasks, +20pp on 5 tasks): Tool design incompatible with calling paradigm
   - Root cause: retrieve_information required LLM to pass document text as JSON parameter
   - Fix: Made tool stateful (auto-search cached documents)
   - Key insight: "Code correct but design unusable" — hardest to detect
@@ -94,6 +94,7 @@
 | Confirmed (with causal data) | 5 |
 | Suspected (needs experiment) | 4 |
 | Non-interference | 1 (INT-11: cache hit rate) |
-| Total accuracy recovered | 34% → 60% (+26pp on 5 tasks) |
+| Total accuracy recovered | 34% → 48% (+14pp on 50 tasks) |
 | Of which: bug fixes | 34% → 40% (+6pp) |
-| Of which: interference fixes | 40% → 60% (+20pp) |
+| Of which: interference fixes | 40% → 48% (+8pp) |
+| RI success rate | 0/105 (0%) → 305/305 (100%) |

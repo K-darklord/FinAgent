@@ -10,7 +10,7 @@ LOCAL_LLM_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:8000/v1")
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 
 # 评测全局配置
-MAX_TOOL_CALLS_PER_TASK = 25
+MAX_TOOL_CALLS_PER_TASK = 50
 # Alias for agent.py
 MAX_TOOL_CALLS = MAX_TOOL_CALLS_PER_TASK
 REQUEST_TIMEOUT = 15

@@ -34,7 +34,7 @@
 | INT-03 | Fallback "ONE LINE ONLY" | Hyperparam | v0 (50 tasks) | 30% | v1 relaxed (50 tasks) | 34% | **+4pp** | Overly restrictive prompt truncated info |
 | INT-04 | max_tokens=256 | Hyperparam | v0 (50 tasks) | 22% | v1 256 maintained (50 tasks) | 34% | **+12pp** | Increasing to 1024 had no effect; issue was elsewhere |
 | INT-05 | max_steps=25→50 | Hyperparam | v3 baseline (50 tasks, max_steps=25) | 48% | INT-05 (50 tasks, max_steps=50) | 54% | **+6pp** | complete_failure 20→13 (-7), total errors 26→23 (-3). Confirmed interference. |
-| INT-06 | Context 8000 chars | Hyperparam | SUSPECTED | TBD | TBD | TBD | TBD | Needs controlled experiment |
+| INT-06 | T2 trajectory 4000→20000 chars | Hyperparam | INT-05 trajectories (T2=4000) | 54% | INT-06 (T2=20000, same trajectories) | 56% | **+2pp** | Hard 33.3→41.7%, Beat-or-Miss +1 task. Minimal interference; judge already had enough context. |
 | INT-07 | Judge self-eval bias | Mechanism | SUSPECTED | TBD | TBD | TBD | TBD | Needs multi-model judge experiment |
 | INT-12 | Forced synthesis | Mechanism | SUSPECTED | TBD | TBD | TBD | TBD | Needs with/without comparison |
 

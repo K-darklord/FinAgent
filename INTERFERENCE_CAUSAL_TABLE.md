@@ -36,7 +36,7 @@
 | INT-05 | max_steps=25→50 | Hyperparam | v3 baseline (50 tasks, max_steps=25) | 48% | INT-05 (50 tasks, max_steps=50) | 54% | **+6pp** | complete_failure 20→13 (-7), total errors 26→23 (-3). Confirmed interference. |
 | INT-06 | T2 trajectory 4000→20000 chars | Hyperparam | INT-05 trajectories (T2=4000) | 54% | INT-06 (T2=20000, same trajectories) | 56% | **+2pp** | Hard 33.3→41.7%, Beat-or-Miss +1 task. Minimal interference; judge already had enough context. |
 | INT-07 | Judge self-eval bias | Mechanism | PAUSED (cost) | TBD | TBD | TBD | TBD | V4-Pro judge too expensive; deferred. Use V4.1-Flash or R1 as cheaper alternative, or limit V4-Pro to boundary cases only. |
-| INT-12 | Forced synthesis | Mechanism | SUSPECTED | TBD | TBD | TBD | TBD | Needs with/without comparison |
+| INT-12 | Hidden max_steps + forced synthesis | Mechanism | PLANNED (Option D) | TBD | TBD | TBD | TBD | Dual-layer interference: max_steps is hidden constraint, fallback is compensation. Test: make budget transparent + remove fallback. See experiments/20260916_int12_transparent_budget/EXPERIMENT.md |
 
 ---
 

@@ -1,6 +1,6 @@
 # FinAgent Evaluation Standard
 
-**Version**: 2.1 (2026-09-13)
+**Version**: 2.3 (2026-09-15)
 **Author**: FinAgent Project
 **Alignment**: Finance Agent Benchmark (FAB) v2 + FrontierFinance + BigFinanceBench
 
@@ -420,6 +420,8 @@ Cross-interface comparison (ReAct vs native function calling) will isolate forma
 | INT-08 | **temperature=0 not optimal** | SUSPECTED | Some models perform better with slight temperature (0.1-0.3) for creative retrieval | Run with temperature=0.1, 0.3 and compare |
 | INT-09 | **Fallback prompt quality** | SUSPECTED | Fallback generates from truncated context → may produce incomplete answers | Compare fallback vs forced-answer with tool_choice="none" |
 | INT-10 | **Single judge model** | SUSPECTED | T2 uses single model (V4-Flash) for judging → model-specific biases | Multi-model judge ensemble (V4-Flash + Llama-3.3-70B + Qwen-2.5-72B) |
+| INT-11 | **Tool result cache** | NOT_INTERFERENCE | 0 cache hits = agent exploring different params (correct behavior). High cache hits would indicate agent stuck in loop (capability defect). Cache is a performance optimization, not an evaluation factor. | No action needed. Cache hits rate could be a diagnostic metric (high = stuck, low = exploring). |
+| INT-12 | **Forced synthesis step** | SUSPECTED | Forcing model to answer when remaining steps ≤5 deprives search time. FAB/SWE-agent do NOT force synthesis. Could reduce score for thorough models. | Compare with/without forced synthesis; align with FAB |
 
 ### 11.3 Monitoring Variables (P4, Long-term)
 

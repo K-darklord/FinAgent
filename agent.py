@@ -25,6 +25,18 @@ import re
 # ------------------------- 工具定义 (真实可调用的) -------------------------
 # 本地 evidence stub：当真实网络不可达时兜底，返回对齐 evidence 的文本。
 # 这样你在任何环境都能跑通；能联网时走真实抓取，两者 trajectory 结构完全一致。
+
+# ------------------------- Document Cache (for retrieve_information) -------------------------
+# In native function calling, LLMs cannot pass 2000+ chars of document text as a
+# function parameter. This cache stores outputs from parse_html/fetch_url so that
+# retrieve_information can search through them without requiring the LLM to pass text.
+_DOCUMENT_CACHE = []
+
+def reset_document_cache():
+    """Reset the document cache at the start of each task."""
+    global _DOCUMENT_CACHE
+    _DOCUMENT_CACHE = []
+
 _LOCAL_EVIDENCE = {
     "nvidia": "NVIDIA FY2024 annual report: Revenue $60,922 million.",
     "apple": "Apple: FY2023 net sales $383,285 million; FY2024 $391,035 million.",
@@ -79,7 +91,7 @@ def fetch_url(url: str, timeout: int = 20) -> str:
             # Remove long numeric/metadata runs (50+ chars of digits/dots/dashes)
             text = _re.sub(r"[\d\s\-\\.]{50,}", " ", text)
             text = " ".join(text.split())  # re-collapse whitespace
-
+            _DOCUMENT_CACHE.append(text)
             # Find the first substantial text content
             # SEC filings: the actual content starts at "UNITED STATES" or "SECURITIES AND EXCHANGE"
             # For iXBRL filings this can be 100K+ chars into the text. I search up to 500K.
@@ -244,26 +256,31 @@ def parse_html(url: str, timeout: int = 20, offset: int = 0, max_chars: int = 15
         text = _re.sub(r"</ix:[^>]*>", " ", text)
         text = " ".join(text.split())
 
-        return text[offset:offset+max_chars] if text else "[empty page]"
+        result = text[offset:offset+max_chars] if text else "[empty page]"
+        _DOCUMENT_CACHE.append(result)
+        return result
     except Exception as e:
         return f"parse_html failed: {e}"
 
 
-def retrieve_information(text: str = "", query: str = "", max_chars: int = 4000) -> str:
+def retrieve_information(query: str = "", max_chars: int = 4000) -> str:
     """
-    Retrieve relevant sentences from a block of text based on a query.
+    Retrieve relevant sentences from previously fetched documents based on a query.
+    I search through all documents cached from previous parse_html/fetch_url calls.
     I do simple keyword matching: find sentences containing query keywords.
-    I accept missing text gracefully and return a helpful message.
+    No need to pass document text — I automatically search the document cache.
     """
     import re as _re
 
     if not query:
         return "Error: query parameter is required"
-    if not text:
-        return "Error: text parameter is required. Use fetch_url or parse_html first to get document text, then pass it as the text parameter."
 
-    # Split into sentences
-    sentences = _re.split(r'(?<=[.!?])\s+', text)
+    if not _DOCUMENT_CACHE:
+        return "No documents in cache. Use parse_html or fetch_url first to fetch a document, then call retrieve_information with your query."
+
+    # Combine all cached documents
+    all_text = " ".join(_DOCUMENT_CACHE)
+    sentences = _re.split(r'(?<=[.!?])\s+', all_text)
     # Extract keywords from query (words > 3 chars, not stopwords)
     stopwords = {"what", "when", "where", "which", "how", "much", "many", "the", "for", "from", "that", "this", "with", "were", "was", "are", "been", "have", "has", "had"}
     keywords = [w.lower().strip(".,?;:\"'()") for w in query.split() if len(w) > 3 and w.lower() not in stopwords]
@@ -276,7 +293,7 @@ def retrieve_information(text: str = "", query: str = "", max_chars: int = 4000)
 
     scored.sort(key=lambda x: -x[0])
     result = " ".join(s for _, s in scored[:5])
-    return result[:max_chars] if result else text[:max_chars]
+    return result[:max_chars] if result else "No matching sentences found."
 
 
 TOOLS = {
@@ -290,7 +307,7 @@ TOOL_SCHEMA = [
     {
         "name": "fetch_url",
         "description": "Fetch a public URL and return a raw text snippet (first 1500 chars).",
-        "parameters": {"url": "string (url to retrieve)"},
+        "parameters": {"url": "string (REQUIRED: url to retrieve)"},
     },
     {
         "name": "edgar_search",
@@ -300,12 +317,12 @@ TOOL_SCHEMA = [
     {
         "name": "parse_html",
         "description": "Fetch a URL and extract clean text from HTML, stripping tags and scripts. Use this to read SEC filing pages. Supports offset for pagination: if the first call does not contain the answer, call again with offset=15000 to read the next section.",
-        "parameters": {"url": "string (url to parse)", "offset": "int (optional: start reading from this char position, useful for long documents, default 0)", "max_chars": "int (optional: max chars to return, default 15000)"},
+        "parameters": {"url": "string (REQUIRED: url to parse)", "offset": "int (optional: start reading from this char position, useful for long documents, default 0)", "max_chars": "int (optional: max chars to return, default 15000)"},
     },
     {
         "name": "retrieve_information",
-        "description": "Find relevant sentences from a text block based on keywords in the query. Use this to extract specific data from retrieved documents. IMPORTANT: the text parameter must be the full output from a previous fetch_url or parse_html call (do NOT truncate it). The query should be the specific information you are looking for (e.g. 'revenue 2024' or 'operating margin'). Returns up to 4000 chars of matching sentences.",
-        "parameters": {"text": "string (the FULL text from previous fetch_url/parse_html output)", "query": "string (the specific information to find, e.g. 'revenue 2024' or 'channel partners')"},
+        "description": "Search through previously fetched documents (from parse_html/fetch_url) for sentences matching your query. No need to pass document text — the tool automatically searches all cached documents. Use this to extract specific data (e.g. revenue, margin, dates) from documents you have already fetched. The query should be the specific information you are looking for.",
+        "parameters": {"query": "string (REQUIRED: the specific information to find, e.g. 'revenue 2024' or 'operating margin')"},
     },
 ]
 
@@ -739,6 +756,7 @@ class HuggingFaceAgent(BaseAgent):
         raise last_error
 
     def solve(self, task) -> AgentResult:
+        reset_document_cache()
         result = AgentResult(task_id=task.task_id, model_name=self.model)
         t0 = time.time()
         steps: list[TrajectoryStep] = []
@@ -768,6 +786,9 @@ class HuggingFaceAgent(BaseAgent):
         context_parts = []
         step_num = 1
         max_steps = config.MAX_TOOL_CALLS_PER_TASK
+        _tool_cache = {}  # Cache: (tool_name, frozenset(args)) -> output
+        _call_counts = {}  # Dedup: (tool_name, arg_signature) -> count
+        _MAX_DUPLICATE = 3  # Max times same tool+args before forcing synthesis
 
         for iteration in range(max_steps):
             try:
@@ -795,6 +816,7 @@ class HuggingFaceAgent(BaseAgent):
             # Check if model wants to call tools
             if msg.tool_calls:
                 messages.append(msg)
+                _force_synthesis = False
                 for tc in msg.tool_calls:
                     tool_name = tc.function.name
                     try:
@@ -808,15 +830,35 @@ class HuggingFaceAgent(BaseAgent):
                                         "content": f"Tool {tool_name} not found."})
                         continue
 
-                    t_start = time.time()
-                    try:
-                        sig = _ins.signature(tool_fn)
-                        valid_params = set(sig.parameters.keys())
-                        filtered_args = {k: v for k, v in args.items() if k in valid_params}
-                        tool_out = tool_fn(**filtered_args)
-                    except Exception as e:
-                        tool_out = f"Tool error: {e}"
-                    latency = (time.time() - t_start) * 1000
+                    # Dedup key: tool_name + sorted args
+                    _arg_sig = _json.dumps(args, sort_keys=True)
+                    _dedup_key = (tool_name, _arg_sig)
+                    _call_counts[_dedup_key] = _call_counts.get(_dedup_key, 0) + 1
+
+                    # Check cache first
+                    _cache_key = (tool_name, _arg_sig)
+                    if _cache_key in _tool_cache:
+                        tool_out = _tool_cache[_cache_key]
+                        latency = 0.0
+                    elif _call_counts[_dedup_key] >= _MAX_DUPLICATE:
+                        # Same tool+args called 3+ times -> force synthesis
+                        tool_out = ("[CACHED] You have already called this tool with the same arguments "
+                                    "multiple times. Please use the information you already have to answer "
+                                    "the question, or try different arguments/offset.")
+                        _force_synthesis = True
+                        latency = 0.0
+                    else:
+                        t_start = time.time()
+                        try:
+                            sig = _ins.signature(tool_fn)
+                            valid_params = set(sig.parameters.keys())
+                            filtered_args = {k: v for k, v in args.items() if k in valid_params}
+                            tool_out = tool_fn(**filtered_args)
+                        except Exception as e:
+                            tool_out = f"Tool error: {e}"
+                        latency = (time.time() - t_start) * 1000
+                        # Cache the result
+                        _tool_cache[_cache_key] = tool_out
 
                     steps.append(TrajectoryStep(
                         step=step_num,
@@ -834,6 +876,13 @@ class HuggingFaceAgent(BaseAgent):
                         "tool_call_id": tc.id,
                         "content": str(tool_out)[:8000],
                     })
+                
+                # If force_synthesis, break out of tool loop to generate answer
+                if _force_synthesis:
+                    # Add a message telling model to answer now
+                    messages.append({"role": "user", "content": 
+                        "You have repeated the same tool calls multiple times. "
+                        "Please provide your final answer based on the information gathered so far."})
             else:
                 # No tool calls -> model gave final answer
                 answer = msg.content or ""
@@ -918,6 +967,7 @@ class OpenAIAgent(BaseAgent):
         return tools
 
     def solve(self, task) -> AgentResult:
+        reset_document_cache()
         result = AgentResult(task_id=task.task_id, model_name=self.model)
         t0 = time.time()
         steps: list[TrajectoryStep] = []
@@ -1022,6 +1072,13 @@ class OpenAIAgent(BaseAgent):
                         "tool_call_id": tc.id,
                         "content": str(tool_out)[:8000],
                     })
+                
+                # If force_synthesis, break out of tool loop to generate answer
+                if _force_synthesis:
+                    # Add a message telling model to answer now
+                    messages.append({"role": "user", "content": 
+                        "You have repeated the same tool calls multiple times. "
+                        "Please provide your final answer based on the information gathered so far."})
             else:
                 # No tool calls -> model gave final answer
                 answer = msg.content or ""

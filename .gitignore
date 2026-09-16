@@ -89,3 +89,11 @@ cache/
 *.tar.gz
 *.zip
 *.7z
+
+# ===========================
+# Research evidence & drafts (not tracked, local only)
+# ===========================
+experiments/
+paper_outline.md
+paper/
+

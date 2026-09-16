@@ -206,3 +206,99 @@ max_steps fallback prompt is still not strong enough. Agent retrieves real conte
 
 ### Key lesson
 **Context size matters more than prompt engineering.** Increasing fallback context from 3000 to 6000 chars gave +6% accuracy (28% to 34%). Few-shot examples and post-processing both hurt accuracy by truncating answers. The model needs full retrieved context to generate complete answers, not tighter formatting constraints.
+
+---
+
+## 2026-09-16 — Interference Experiments (INT-05, INT-06, INT-07 paused, INT-12 designed)
+
+### Summary
+Today's work focused on **controlled interference experiments** following the
+"every interference is a future test" principle. The accuracy trajectory
+across experiments: 48% (v3 baseline) → 54% (INT-05) → 56% (INT-06).
+
+### Experiments Conducted
+
+#### INT-05: max_steps 25→50 (CONFIRMED interference, +6pp)
+- **Hypothesis**: max_steps=25 prematurely terminated model search
+- **Method**: Single variable change, 50 FAB public tasks, V4-Flash
+- **Result**: 48% (24/50) → 54% (27/50), complete_failure 20→13 (-7)
+- **Conclusion**: Hyperparameter interference confirmed. Model needs more
+  search budget to complete thorough investigations on SEC filings.
+- **Commit**: 4d4862d
+
+#### INT-06: T2 trajectory 4000→20000 chars (MINIMAL interference, +2pp)
+- **Hypothesis**: T2 judge trajectory truncation at 4000 chars cut off context
+- **Method**: Reused INT-05 trajectories, only changed T2_MAX_TRAJECTORY_CHARS
+- **Result**: 54% (27/50) → 56% (28/50), only 1 task flipped (Hard Beat-or-Miss)
+- **Conclusion**: Minimal interference. T2 judge already had sufficient context
+  in 4000 chars for most tasks. Hard difficulty benefited most (+8.34pp).
+- **Commit**: aaeb3de
+
+#### INT-07: T2 judge V4-Flash→V4-Pro (PAUSED, cost)
+- **Hypothesis**: Same model for agent and judge creates self-evaluation bias
+- **Status**: PAUSED — V4-Pro inference cost ~10x V4-Flash
+- **Resume Strategies**:
+  - Option A: Use cheaper alt judge (V4.1-Flash or R1)
+  - Option B: Targeted V4-Pro on boundary cases only (final_score ∈ [0.4, 0.6])
+  - Option C: Full V4-Pro run (most rigorous, highest cost)
+- **Recommended**: Option B balances cost and statistical signal
+- **Commit**: 0844129
+
+#### INT-12: Transparent budget + no fallback (PLANNED, Option D)
+- **Key Insight**: INT-12 is a DUAL-LAYER interference structure:
+  - Layer 1 (INT-05): max_steps is a HIDDEN constraint (model doesn't know budget)
+  - Layer 2 (INT-12): fallback synthesis is COMPENSATION for Layer 1
+  - Removing Layer 2 alone = double punishment (still cut off + no compensation)
+- **Pre-experiment evidence**: 9/50 tasks used fallback, ALL 9 returned
+  "Not found" (0% accuracy) → Option B (remove fallback only) = NO-OP
+- **Real test**: Can model AVOID hitting max_steps once it knows its budget?
+- **Code changes**: (1) Add budget to system prompt, (2) Replace fallback
+  synthesis with explicit "Not found"
+- **Confounding controls**: Option D-placebo (equal-length irrelevant prompt
+  addition) to isolate transparency effect from prompt change effect
+- **Status**: PLANNED, awaiting execution
+- **Commits**: a7192d7, 8c89a04
+
+### Accuracy Trajectory (cumulative)
+| Date | Version | Accuracy | Delta | Notes |
+|---|---|---|---|---|
+| 2026-09-12 | v0-ReAct (V4-Pro) | 8.3% | — | Format tax |
+| 2026-09-13 | v1 (50 tasks) | 34% | +25.7pp | FC + bug fixes |
+| 2026-09-13 | v0 with neg examples | 16% | -18pp | Regression test |
+| 2026-09-13 | v1 maintained | 34% | +18pp | Restored |
+| 2026-09-16 | v3-interference-fix (50 tasks) | 48% | +14pp | INT-13/14 fixes |
+| 2026-09-16 | INT-05 (max_steps=50) | 54% | +6pp | INT-05 confirmed |
+| 2026-09-16 | INT-06 (T2=20000) | 56% | +2pp | INT-06 minimal |
+
+### Interference Causal Table Updates
+- INT-05: SUSPECTED → CONFIRMED (+6pp)
+- INT-06: SUSPECTED → MINIMAL (+2pp)
+- INT-07: SUSPECTED → PAUSED (cost)
+- INT-12: SUSPECTED → PLANNED (Option D, dual-layer insight)
+
+### Key Files Modified
+- `INTERFERENCE_CAUSAL_TABLE.md` — Updated with INT-05/06/07/12 statuses
+- `experiments/20260916_int05_max_steps/EXPERIMENT.md` — Results + Incident log
+- `experiments/20260916_int06_context_length/EXPERIMENT.md` — Results
+- `experiments/20260916_int07_judge_bias/EXPERIMENT.md` — Pause + resume strategies
+- `experiments/20260916_int12_transparent_budget/EXPERIMENT.md` — Full design with 5 gaps filled
+
+### Key Insights Discovered
+1. **Dual-layer interference** (INT-12): max_steps is hidden constraint,
+   fallback is compensation — removing one without the other is unfair
+2. **Fallback produces 0% accuracy**: 9/9 fallback outputs were "Not found",
+   meaning fallback never actually helped the model
+3. **FAB official has no published max_steps**: Our 50-step hidden cap is
+   a deviation from FAB philosophy
+4. **Hard tasks benefit most from budget**: INT-06 Hard +8.34pp, INT-05
+   reduced Hard failures significantly
+5. **complete_failure dominates errors**: 13/50 in INT-05, all from "Not found"
+   — points to retrieval/search strategy, not reasoning capability
+
+### Remaining Work
+- [HIGH] Execute INT-12 Option D (transparent budget + no fallback)
+- [HIGH] Resume INT-07 with Option B (targeted V4-Pro on boundary cases)
+- [MEDIUM] Run INT-12 Option D-placebo for confounding control
+- [MEDIUM] Investigate why Adjustments (0%) and Market Analysis (0%) categories
+  remain at 0% across all experiments
+- [LOW] Multi-seed runs for variance estimation

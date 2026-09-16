@@ -414,14 +414,14 @@ Cross-interface comparison (ReAct vs native function calling) will isolate forma
 
 | ID | Interference | Status | Hypothesis | Experiment Needed |
 |---|---|---|---|---|
-| INT-05 | **max_steps=15 too restrictive** | SUSPECTED | V4-Pro needs more steps (4 edgar_search + 10 parse_html); 15 may not be enough for thorough models | Run with max_steps=20, 25, 30 and compare accuracy delta |
-| INT-06 | **Context truncation 8000 chars** | SUSPECTED | SEC 10-K filings are 50K+ chars; 8000 may cut key data | Run with 12000, 16000 context and measure if complete_failure drops |
-| INT-07 | **T2 judge self-evaluation bias** | SUSPECTED | V4-Flash judges V4-Flash answers → may be lenient or harsh on itself | Run T2 with Llama-3.3-70B as judge, compare scores |
+| INT-05 | **max_steps=25 too restrictive** | **CONFIRMED (+6pp)** | max_steps=25 prematurely cut model search; 20/20 "Not found" hit ≥24 steps. Increased to 50: 48%→54%, complete_failure 20→13. | DONE (2026-09-16): max_steps=25→50, +6pp |
+| INT-06 | **T2 trajectory truncation 4000 chars** | **MINIMAL (+2pp)** | T2_MAX_TRAJECTORY_CHARS=4000 truncates judge context. Avg trajectory 58KB. Increased to 20000: 54%→56%, 1 task flipped (Hard). | DONE (2026-09-16): T2=4000→20000, +2pp, minimal |
+| INT-07 | **T2 judge self-evaluation bias** | **PAUSED (cost)** | V4-Flash judges V4-Flash answers → may be lenient/harsh. V4-Pro as judge too expensive (~10x cost). | DEFERRED: Option B (targeted V4-Pro on boundary cases) recommended |
 | INT-08 | **temperature=0 not optimal** | SUSPECTED | Some models perform better with slight temperature (0.1-0.3) for creative retrieval | Run with temperature=0.1, 0.3 and compare |
 | INT-09 | **Fallback prompt quality** | SUSPECTED | Fallback generates from truncated context → may produce incomplete answers | Compare fallback vs forced-answer with tool_choice="none" |
 | INT-10 | **Single judge model** | SUSPECTED | T2 uses single model (V4-Flash) for judging → model-specific biases | Multi-model judge ensemble (V4-Flash + Llama-3.3-70B + Qwen-2.5-72B) |
 | INT-11 | **Tool result cache** | NOT_INTERFERENCE | 0 cache hits = agent exploring different params (correct behavior). High cache hits would indicate agent stuck in loop (capability defect). Cache is a performance optimization, not an evaluation factor. | No action needed. Cache hits rate could be a diagnostic metric (high = stuck, low = exploring). |
-| INT-12 | **Forced synthesis step** | SUSPECTED | Forcing model to answer when remaining steps ≤5 deprives search time. FAB/SWE-agent do NOT force synthesis. Could reduce score for thorough models. | Compare with/without forced synthesis; align with FAB |
+| INT-12 | **Hidden max_steps + forced synthesis (dual-layer)** | **PLANNED (Option D)** | **Dual-layer interference**: max_steps is HIDDEN constraint (model doesn't know budget), fallback synthesis is COMPENSATION. Pre-evidence: 9/9 fallback outputs were "Not found" (0% correct). | PLANNED: Option D = transparent budget + no fallback. See experiments/20260916_int12_transparent_budget/ |
 
 ### 11.3 Monitoring Variables (P4, Long-term)
 

@@ -327,3 +327,32 @@ across experiments: 48% (v3 baseline) → 54% (INT-05) → 56% (INT-06).
 
 ### Changes
 - `agent.py`: fetch_url offset/max_chars, tool output truncation 8000→15000, fallback prompt strengthened, fetch_url TOOL_SCHEMA updated
+
+### Test results (2026-09-18 run)
+- **Accuracy: 36/50 = 72.00%** (up from 34% baseline, target was 50-60%)
+- T1 (numeric): 0.455 | T2 (LLM semantic): 0.644 | Final: 0.722
+- Dealbreakers: 2/50 | Complete failures: 6 (down from 25)
+- API failures: 0/50
+
+#### By category
+| Category | Accuracy |
+|----------|----------|
+| Financial Modeling Projections | 100.00% (4/4) |
+| Numerical Reasoning | 87.50% (7/8) |
+| Quantitative Retrieval | 77.78% (7/9) |
+| Adjustments | 75.00% (3/4) |
+| Complex Retrieval | 66.67% (2/3) |
+| Qualitative Retrieval | 66.67% (6/9) |
+| Trends | 66.67% (2/3) |
+| Beat or Miss | 57.14% (4/7) |
+| Market Analysis | 33.33% (1/3) |
+
+#### By difficulty
+- Easy: 68.18% (15/22)
+- Medium: 87.50% (14/16)
+- Hard: 58.33% (7/12)
+
+#### Gap to FAB leaderboard
+- DeepSeek V4 Pro: 60.4%
+- FinAgent (V4-Flash, with fixes): 72.00%
+- **FinAgent now exceeds the V4 Pro leaderboard baseline by 11.6%**

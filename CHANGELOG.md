@@ -302,3 +302,28 @@ across experiments: 48% (v3 baseline) → 54% (INT-05) → 56% (INT-06).
 - [MEDIUM] Investigate why Adjustments (0%) and Market Analysis (0%) categories
   remain at 0% across all experiments
 - [LOW] Multi-seed runs for variance estimation
+
+---
+
+## 2026-09-18 — TOOL_BROKEN + REASONING_PREFIX fixes (target: 34% → 50-60%)
+
+### Fixed (TOOL_BROKEN — 10 questions: tools called but no real content)
+1. **fetch_url pagination**: Added `offset` and `max_chars` parameters to `fetch_url`. Agent can now call `fetch_url(url, offset=15000)` to read the next section of a long document. Default return increased from 8000 to 15000 chars.
+2. **Tool output truncation fix**: Increased per-tool-output truncation in messages from 8000 to 15000 chars. Previously, `parse_html` returned 15000 chars but the LLM only saw the first 8000 (messages truncated at 8000). Now the LLM sees the full 15000 chars from each tool call, enabling it to decide whether to paginate.
+3. **fetch_url TOOL_SCHEMA**: Updated description and parameters to document offset/max_chars support. Agent now knows it can paginate both `fetch_url` and `parse_html`.
+
+### Fixed (REASONING_PREFIX — 8 questions: agent has data but outputs reasoning)
+4. **Fallback prompt strengthened**: Changed max_steps fallback system prompt from "Based ONLY on the provided context, answer the question directly" to "You MUST extract the answer DIRECTLY from the context below. Do NOT repeat or restate the question. Do NOT explain your reasoning." This forces the model to extract the answer from context instead of outputting reasoning like "The question asks...".
+5. Applied same fallback prompt fix to both HuggingFaceAgent and OpenAIAgent for consistency.
+
+### Already fixed (retrieve_information parameter error — 5 questions)
+6. `retrieve_information` now uses `_DOCUMENT_CACHE` (introduced in native FC commit). No `text` parameter needed — the tool automatically searches all documents cached from previous `parse_html`/`fetch_url` calls. This eliminates the parameter error where the LLM didn't know to pass document text.
+
+### Key constraints respected
+- No few-shot examples (tested negative: 30% → 16%)
+- No regex post-processing truncation (tested negative)
+- Fallback context size kept at 8000 (≥6000 minimum)
+- Code comments in English
+
+### Changes
+- `agent.py`: fetch_url offset/max_chars, tool output truncation 8000→15000, fallback prompt strengthened, fetch_url TOOL_SCHEMA updated

@@ -52,13 +52,14 @@ def _local_fallback(url: str) -> str:
     return "[stub] no evidence found"
 
 
-def fetch_url(url: str, timeout: int = 20) -> str:
+def fetch_url(url: str, timeout: int = 20, offset: int = 0, max_chars: int = 15000) -> str:
     """
     Fetch a URL and return clean text content.
     I use a SEC-compliant User-Agent with contact email.
     I strip HTML tags, skip XBRL metadata (common in SEC iXBRL filings),
     and return readable text, falling back to local stub on failure.
-    I return up to 8000 chars to capture actual content past XBRL headers.
+    I support offset for pagination: call with offset=15000 to read the next
+    section of a long document. I return up to 15000 chars per call.
     """
     import re as _re
     try:
@@ -113,7 +114,7 @@ def fetch_url(url: str, timeout: int = 20) -> str:
         else:
             text = raw
 
-        snippet = text[:8000]
+        snippet = text[offset:offset+max_chars]
         if len(snippet.strip()) < 50:
             return _local_fallback(url)
         return snippet
@@ -306,8 +307,8 @@ TOOLS = {
 TOOL_SCHEMA = [
     {
         "name": "fetch_url",
-        "description": "Fetch a public URL and return a raw text snippet (first 1500 chars).",
-        "parameters": {"url": "string (REQUIRED: url to retrieve)"},
+        "description": "Fetch a public URL and return clean text content. Supports offset for pagination: call with offset=15000 to read the next section of a long document. Returns up to 15000 chars per call.",
+        "parameters": {"url": "string (REQUIRED: url to retrieve)", "offset": "int (optional: start reading from this char position, default 0)", "max_chars": "int (optional: max chars to return, default 15000)"},
     },
     {
         "name": "edgar_search",
@@ -870,11 +871,11 @@ class HuggingFaceAgent(BaseAgent):
                         latency_ms=round(latency, 1),
                     ))
                     step_num += 1
-                    context_parts.append(str(tool_out)[:8000])
+                    context_parts.append(str(tool_out)[:15000])
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": str(tool_out)[:8000],
+                        "content": str(tool_out)[:15000],
                     })
                 
                 # If force_synthesis, break out of tool loop to generate answer
@@ -900,13 +901,12 @@ class HuggingFaceAgent(BaseAgent):
             context = "\n\n".join(context_parts)[:8000]
             fallback_msgs = [
                 {"role": "system", "content": "You are a financial analysis assistant. "
-                  "Based ONLY on the provided context, answer the question directly.\n"
-                  "CRITICAL formatting rules:\n"
-                  "- Output ONLY the factual answer (numbers, names, or direct statements).\n"
-                  "- Do NOT include any reasoning or preamble.\n"
-                  "- If the answer is a number, give the number with unit.\n"
-                  "- If qualitative, state the fact directly.\n"
-                  "- If you cannot find the answer, say: Not found in the retrieved documents."},
+                  "You MUST extract the answer DIRECTLY from the context below.\n"
+                  "Do NOT repeat or restate the question. Do NOT explain your reasoning.\n"
+                  "Output ONLY the factual answer (numbers, names, or direct statements).\n"
+                  "If the answer is a number, give the number with unit.\n"
+                  "If qualitative, state the fact directly.\n"
+                  "If you cannot find the answer in the context, say: Not found in the retrieved documents."},
                 {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {task.prompt}\n\nAnswer:"},
             ]
             try:
@@ -1066,11 +1066,11 @@ class OpenAIAgent(BaseAgent):
                         latency_ms=round(latency, 1),
                     ))
                     step_num += 1
-                    context_parts.append(str(tool_out)[:8000])
+                    context_parts.append(str(tool_out)[:15000])
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": str(tool_out)[:8000],
+                        "content": str(tool_out)[:15000],
                     })
                 
                 # If force_synthesis, break out of tool loop to generate answer
@@ -1095,13 +1095,12 @@ class OpenAIAgent(BaseAgent):
             context = "\n\n".join(context_parts)[:8000]
             fallback_msgs = [
                 {"role": "system", "content": "You are a financial analysis assistant. "
-                  "Based ONLY on the provided context, answer the question directly.\n"
-                  "CRITICAL formatting rules:\n"
-                  "- Output ONLY the factual answer (numbers, names, or direct statements).\n"
-                  "- Do NOT include any reasoning or preamble.\n"
-                  "- If the answer is a number, give the number with unit.\n"
-                  "- If qualitative, state the fact directly.\n"
-                  "- If you cannot find the answer, say: Not found in the retrieved documents."},
+                  "You MUST extract the answer DIRECTLY from the context below.\n"
+                  "Do NOT repeat or restate the question. Do NOT explain your reasoning.\n"
+                  "Output ONLY the factual answer (numbers, names, or direct statements).\n"
+                  "If the answer is a number, give the number with unit.\n"
+                  "If qualitative, state the fact directly.\n"
+                  "If you cannot find the answer in the context, say: Not found in the retrieved documents."},
                 {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {task.prompt}\n\nAnswer:"},
             ]
             try:
